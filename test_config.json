@@ -1,0 +1,54 @@
+{
+    "test_database": {
+        "path": "test_trading_bot.db",
+        "backup_enabled": true,
+        "backup_interval_hours": 24
+    },
+    "test_settings": {
+        "default_initial_balance": 10000.0,
+        "default_test_duration": 100,
+        "max_test_duration": 10000,
+        "simulation_speed_ms": 50,
+        "auto_save_results": true
+    },
+    "strategies_config": {
+        "allowed_strategies": [
+            "adaptive_ml_strategy",
+            "scalping_strategy",
+            "trend_following_strategy",
+            "mean_reversion_strategy",
+            "breakout_strategy"
+        ],
+        "default_parameters": {
+            "risk_percentage": 2.0,
+            "stop_loss_percentage": 5.0,
+            "take_profit_percentage": 10.0
+        }
+    },
+    "simulation_config": {
+        "symbols": ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT"],
+        "price_ranges": {
+            "BTCUSDT": {"min": 35000, "max": 70000},
+            "ETHUSDT": {"min": 2000, "max": 4500},
+            "ADAUSDT": {"min": 0.3, "max": 1.5},
+            "DOTUSDT": {"min": 5, "max": 25},
+            "LINKUSDT": {"min": 8, "max": 30}
+        },
+        "volatility_factor": 0.02,
+        "trend_probability": 0.6
+    },
+    "ui_config": {
+        "window_title": "Bybit Trading Bot - Программа тестирования",
+        "window_size": [1200, 800],
+        "theme": "default",
+        "font_size": 10,
+        "auto_refresh_interval_sec": 5
+    },
+    "logging": {
+        "level": "INFO",
+        "file_path": "test_program.log",
+        "max_file_size_mb": 10,
+        "backup_count": 5,
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    }
+}
