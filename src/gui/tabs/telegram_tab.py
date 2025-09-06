@@ -158,9 +158,7 @@ class TelegramTab(QWidget):
                 
                 # Инициализируем webhook обработчик для кнопок
                 self.command_processor = TelegramCommandProcessor(
-                    config_manager=self.config,
-                    db_manager=self.db,
-                    strategy_engine=None  # TODO: передать strategy_engine когда будет доступен
+                    db_manager=self.db
                 )
                 self.webhook_handler = TelegramWebhookHandler(
                     command_processor=self.command_processor

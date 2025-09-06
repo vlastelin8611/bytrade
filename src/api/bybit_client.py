@@ -213,23 +213,7 @@ class BybitClient:
                     response = self.client.get_wallet_balance(**params)
                 elif endpoint == "get_account_info":
                     # Используем правильный метод для получения информации об аккаунте
-                    # В pybit это может быть другой метод или требовать другого подхода
-                    try:
-                        response = self.client.get_account_info(**params)
-                    except AttributeError:
-                        # Если метод не существует, используем альтернативный подход
-                        self.logger.warning("get_account_info метод не найден в pybit клиенте")
-                        # Возвращаем базовую информацию об аккаунте
-                        response = {
-                            "retCode": 0,
-                            "retMsg": "OK",
-                            "result": {
-                                "marginMode": "REGULAR_MARGIN",
-                                "unifiedMarginStatus": 1,
-                                "isMasterTrader": False,
-                                "spotHedgingStatus": "OFF"
-                            }
-                        }
+                    response = self.client.get_account_info(**params)
                 elif endpoint == "get_positions":
                     response = self.client.get_positions(**params)
                 elif endpoint == "get_open_orders":

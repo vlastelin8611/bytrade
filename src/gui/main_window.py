@@ -140,7 +140,7 @@ class MainWindow(QMainWindow):
             
             # 5. Telegram-уведомления
             self.logger.info("Инициализация вкладки Telegram...")
-            self.telegram_tab = TelegramTab(self.config, self.db)
+            self.telegram_tab = TelegramTab(self.db, self.config)
             self.tab_widget.addTab(self.telegram_tab, 
                                  self.icon_manager.get_icon('telegram'), 
                                  "Telegram")
