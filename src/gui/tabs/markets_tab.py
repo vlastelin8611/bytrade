@@ -21,8 +21,9 @@ from PySide6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QDialog, QDialogButtonBox,
     QTextEdit, QDateEdit
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QSortFilterProxyModel, QDate
-from PySide6.QtGui import QFont, QStandardItemModel, QStandardItem, QColor
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QSortFilterProxyModel, QDate, QDateTime
+from PySide6.QtGui import QFont, QStandardItemModel, QStandardItem, QColor, QPainter
+from PySide6.QtCharts import QChart, QChartView, QCandlestickSeries, QCandlestickSet, QLineSeries, QDateTimeAxis, QValueAxis
 
 class MarketDataWorker(QThread):
     """
@@ -592,10 +593,9 @@ class MarketsTab(QWidget):
         self._create_trades_tab(trades_widget)
         details_tabs.addTab(trades_widget, "Последние сделки")
         
-        # Вкладка "График" (заглушка)
+        # Вкладка "График"
         chart_widget = QWidget()
-        chart_layout = QVBoxLayout(chart_widget)
-        chart_layout.addWidget(QLabel("График будет реализован в следующих версиях"))
+        self._create_chart_tab(chart_widget)
         details_tabs.addTab(chart_widget, "График")
         
         layout.addWidget(details_tabs)
@@ -645,7 +645,7 @@ class MarketsTab(QWidget):
         layout = QVBoxLayout(widget)
         
         # Заголовок
-        layout.addWidget(QLabel("Последние сделки"))
+        layout.addWidget(QLabel("Последние сделок"))
         
         # Таблица сделок
         self.trades_table = QTableWidget()
@@ -658,6 +658,61 @@ class MarketsTab(QWidget):
             header.setSectionResizeMode(i, QHeaderView.Stretch)
         
         layout.addWidget(self.trades_table)
+        
+    def _create_chart_tab(self, widget):
+        """
+        Создание вкладки графика цен
+        """
+        layout = QVBoxLayout(widget)
+        
+        # Верхняя панель с настройками
+        controls_layout = QHBoxLayout()
+        
+        # Выбор типа графика
+        chart_type_label = QLabel("Тип графика:")
+        controls_layout.addWidget(chart_type_label)
+        
+        self.chart_type_combo = QComboBox()
+        self.chart_type_combo.addItems(["Свечи", "Линия"])
+        self.chart_type_combo.currentIndexChanged.connect(self._update_chart)
+        controls_layout.addWidget(self.chart_type_combo)
+        
+        # Выбор интервала
+        interval_label = QLabel("Интервал:")
+        controls_layout.addWidget(interval_label)
+        
+        self.interval_combo = QComboBox()
+        self.interval_combo.addItems(["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"])
+        self.interval_combo.setCurrentText("1h")
+        self.interval_combo.currentIndexChanged.connect(self._update_chart)
+        controls_layout.addWidget(self.interval_combo)
+        
+        # Выбор количества свечей
+        limit_label = QLabel("Количество свечей:")
+        controls_layout.addWidget(limit_label)
+        
+        self.limit_combo = QComboBox()
+        self.limit_combo.addItems(["50", "100", "200", "500"])
+        self.limit_combo.setCurrentText("100")
+        self.limit_combo.currentIndexChanged.connect(self._update_chart)
+        controls_layout.addWidget(self.limit_combo)
+        
+        # Кнопка обновления
+        self.update_chart_button = QPushButton("Обновить")
+        self.update_chart_button.clicked.connect(self._update_chart)
+        controls_layout.addWidget(self.update_chart_button)
+        
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
+        
+        # График
+        self.chart_view = QChartView()
+        self.chart_view.setRenderHint(QPainter.Antialiasing)
+        self.chart_view.setMinimumHeight(400)
+        layout.addWidget(self.chart_view)
+        
+        # Создаем пустой график
+        self._create_empty_chart()
     
     def _create_control_buttons(self, layout):
         """
@@ -885,6 +940,9 @@ class MarketsTab(QWidget):
             
             # Обновление последних сделок
             self._update_recent_trades()
+            
+            # Обновление графика
+            self._update_chart()
             
         except Exception as e:
             self.logger.error(f"Ошибка обновления детальной информации: {e}")

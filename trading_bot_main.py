@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QGroupBox, QProgressBar, QMessageBox,
     QSplitter, QFrame, QHeaderView
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, pyqtSignal
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QFont, QColor, QPalette
 
 from src.api.bybit_client import BybitClient

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import traceback
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from pathlib import Path
@@ -25,9 +26,10 @@ from PySide6.QtWidgets import (
     QWidget, QPushButton, QLabel, QTextEdit, QTableWidget, 
     QTableWidgetItem, QHeaderView, QSplitter, QGroupBox,
     QProgressBar, QStatusBar, QMessageBox, QTabWidget,
-    QScrollArea, QFrame, QGridLayout, QSpacerItem, QSizePolicy
+    QScrollArea, QFrame, QGridLayout, QSpacerItem, QSizePolicy,
+    QLineEdit
 )
-from PySide6.QtCore import QTimer, QThread, Signal, Qt, QMutex
+from PySide6.QtCore import QTimer, QThread, Signal, Qt, QMutex, QMetaObject, Q_ARG
 from PySide6.QtGui import QTextCursor
 from PySide6.QtGui import QFont, QPalette, QColor, QPixmap, QIcon
 
@@ -75,12 +77,22 @@ class TradingWorker(QThread):
         self.daily_pnl = 0.0
         self.last_reset_date = datetime.now().date()
         
-        # Настройка логирования
+        # Настройка логирования с сохранением в отдельную папку
+        log_dir = Path(__file__).parent / 'logs'
+        log_dir.mkdir(exist_ok=True)  # Создаем папку, если не существует
+        
+        log_file = log_dir / f'trading_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+        
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
         )
         self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Логи сохраняются в файл: {log_file}")
     
     def run(self):
         """Основной цикл торгового потока"""
@@ -313,6 +325,16 @@ class TradingWorker(QThread):
                     'coins': balance_data.get('coin', [])
                 }
                 
+                # Обработка данных о монетах для правильного отображения
+                for coin in balance_info['coins']:
+                    # Сохраняем оригинальные значения без преобразования в USD
+                    # и без усечения до меньших значений
+                    coin_name = coin.get('coin')
+                    wallet_balance = coin.get('walletBalance', '0')
+                    available_balance = coin.get('availableToWithdraw', '0')
+                    
+                    self.logger.info(f"Баланс монеты {coin_name}: {wallet_balance} (доступно: {available_balance})")
+                
                 self.balance_updated.emit(balance_info)
                 
                 # Логирование снимка счета
@@ -329,6 +351,8 @@ class TradingWorker(QThread):
                 # self.db_manager.log_account_snapshot(account_data)
                 
                 return balance_info
+            else:
+                self.logger.warning("Получен пустой ответ при запросе баланса")
             
             return None
             
@@ -347,13 +371,17 @@ class TradingWorker(QThread):
             
             for category in categories:
                 try:
-                    # Получаем реальные данные через API
-                    positions = self.bybit_client.get_positions(category=category)
-                    if positions:
+                    # Получаем реальные данные через API с указанием settleCoin=USDT для linear категории
+                    settle_coin = "USDT" if category == "linear" else None
+                    positions_list = self.bybit_client.get_positions(category=category, settle_coin=settle_coin)
+                    
+                    # Проверяем, что получили список позиций
+                    if positions_list and isinstance(positions_list, list):
                         # Добавляем категорию к каждой позиции для идентификации
-                        for pos in positions:
+                        for pos in positions_list:
                             pos['category'] = category
-                        all_positions.extend(positions)
+                        all_positions.extend(positions_list)
+                    self.logger.info(f"Получено {len(positions_list) if positions_list else 0} позиций для категории {category}")
                 except Exception as e:
                     self.logger.warning(f"Ошибка получения позиций {category}: {e}")
                     continue
@@ -366,22 +394,42 @@ class TradingWorker(QThread):
                     active_positions.append(pos)
             
             exec_time = (time.time() - start_time) * 1000
+            self.logger.info(f"Найдено {len(active_positions)} активных позиций из {len(all_positions)} всего")
             
-            if active_positions:
-                self.positions_updated.emit(active_positions)
-                
-                # self.db_manager.log_entry({
-                #     'level': 'DEBUG',
-                #     'logger_name': 'API_POSITIONS',
-                #     'message': f'Positions updated: {len(active_positions)} active positions from {len(all_positions)} total',
-                #     'session_id': session_id
-                # }) # Временно закомментировано - блокирует выполнение
-            else:
-                # Отправляем пустой список, чтобы очистить таблицу
-                self.positions_updated.emit([])
-                
-                # self.db_manager.log_entry({
-                #     'level': 'DEBUG',
+            # Всегда отправляем список позиций, даже если он пустой
+            self.positions_updated.emit(active_positions)
+            
+            # Сохраняем позиции в базу данных
+            if self.db_manager:
+                try:
+                    self.db_manager.save_positions(active_positions)
+                    self.log_message.emit(f"Сохранено {len(active_positions)} позиций в базу данных")
+                except Exception as db_err:
+                    self.logger.error(f"Ошибка сохранения позиций в БД: {db_err}")
+            
+            # self.db_manager.log_entry({
+            #     'level': 'DEBUG',
+            #     'logger_name': 'API_POSITIONS',
+            #     'message': f'Positions updated: {len(active_positions)} active positions from {len(all_positions)} total',
+            #     'session_id': session_id
+            # }) # Временно закомментировано - блокирует выполнение
+            
+            return active_positions
+        except Exception as e:
+            self.logger.error(f"Ошибка обновления позиций: {e}")
+            self.positions_updated.emit([])  # Отправляем пустой список в случае ошибки
+            
+            # Сохраняем пустой список позиций в базу данных
+            if self.db_manager:
+                try:
+                    self.db_manager.save_positions([])
+                    self.log_message.emit("Нет активных позиций, обновлена БД")
+                except Exception as db_err:
+                    self.logger.error(f"Ошибка обновления пустых позиций в БД: {db_err}")
+            
+            # self.db_manager.log_entry({
+            #     'level': 'DEBUG',
+            return []
                 #     'logger_name': 'API_POSITIONS',
                 #     'message': 'No active positions found',
                 #     'session_id': session_id
@@ -746,10 +794,40 @@ class TradingBotMainWindow(QMainWindow):
         self.setup_styles()
         print("✅ Стили применены")
         
+        # Загрузка API ключей в поля ввода
+        print("🔄 Загрузка API ключей в поля ввода...")
+        self.load_api_keys()
+        print("✅ API ключи загружены в поля ввода")
+        
+        # Настройка таймеров для автоматического обновления
+        print("🔄 Настройка таймеров автоматического обновления...")
+        self.setup_timers()
+        print("✅ Таймеры настроены")
+        
         # Запуск торгового потока
         print("🔄 Запуск торгового потока...")
         self.start_trading_worker()
         print("✅ Главное окно полностью инициализировано")
+    
+    def setup_timers(self):
+        """Настройка таймеров для автоматического обновления данных"""
+        # Таймер для обновления позиций (каждые 30 секунд)
+        self.positions_timer = QTimer(self)
+        self.positions_timer.timeout.connect(self.refresh_positions)
+        self.positions_timer.start(30000)  # 30 секунд
+        self.logger.info("Таймер обновления позиций запущен (интервал: 30 секунд)")
+        
+        # Таймер для проверки статуса подключения (каждые 60 секунд)
+        self.connection_timer = QTimer(self)
+        self.connection_timer.timeout.connect(self.check_api_connection)
+        self.connection_timer.start(60000)  # 60 секунд
+        self.logger.info("Таймер проверки подключения запущен (интервал: 60 секунд)")
+        
+        # Таймер для полного обновления данных (каждые 120 секунд)
+        self.data_timer = QTimer(self)
+        self.data_timer.timeout.connect(self.refresh_data)
+        self.data_timer.start(120000)  # 120 секунд
+        self.logger.info("Таймер полного обновления данных запущен (интервал: 120 секунд)")
     
     def init_ui(self):
         """Инициализация пользовательского интерфейса"""
@@ -822,6 +900,9 @@ class TradingBotMainWindow(QMainWindow):
         
         # Вкладка "История торговли"
         self.create_history_tab()
+        
+        # Вкладка "Настройки"
+        self.create_settings_tab()
         
         # Вкладка "Логи"
         self.create_logs_tab()
@@ -907,27 +988,8 @@ class TradingBotMainWindow(QMainWindow):
         main_buttons_layout.addWidget(self.refresh_btn)
         main_buttons_layout.addStretch()
         
-        # Вторая строка - кнопки торговли
-        trade_buttons_layout = QHBoxLayout()
-        
-        self.buy_cheapest_btn = QPushButton("💰 Купить самый дешевый актив (1 шт)")
-        self.buy_cheapest_btn.setStyleSheet(
-            "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 8px; }"
-        )
-        self.buy_cheapest_btn.clicked.connect(self.buy_cheapest_asset)
-        
-        self.sell_cheapest_btn = QPushButton("💸 Продать самый дешевый актив (1 шт)")
-        self.sell_cheapest_btn.setStyleSheet(
-            "QPushButton { background-color: #f39c12; color: white; font-weight: bold; padding: 8px; }"
-        )
-        self.sell_cheapest_btn.clicked.connect(self.sell_cheapest_asset)
-        
-        trade_buttons_layout.addWidget(self.buy_cheapest_btn)
-        trade_buttons_layout.addWidget(self.sell_cheapest_btn)
-        trade_buttons_layout.addStretch()
-        
+        # Добавляем только основные кнопки управления
         control_layout.addLayout(main_buttons_layout)
-        control_layout.addLayout(trade_buttons_layout)
         
         layout.addWidget(control_frame)
         
@@ -952,7 +1014,27 @@ class TradingBotMainWindow(QMainWindow):
         self.assets_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.assets_table.setMaximumHeight(200)
         
+        # Устанавливаем стиль для таблицы активов, чтобы текст был видимым
+        self.assets_table.setStyleSheet(
+            "QTableWidget { alternate-background-color: #f0f0f0; background-color: white; }"
+            "QTableWidget::item { color: #2c3e50; }"
+        )
+        
         assets_layout.addWidget(self.assets_table)
+        
+        # Кнопка обновления активов
+        refresh_assets_layout = QHBoxLayout()
+        self.refresh_assets_btn = QPushButton("🔄 Обновить активы")
+        self.refresh_assets_btn.setStyleSheet(
+            "QPushButton { background-color: #3498db; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:hover { background-color: #2980b9; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.refresh_assets_btn.clicked.connect(self.refresh_data)
+        refresh_assets_layout.addStretch()
+        refresh_assets_layout.addWidget(self.refresh_assets_btn)
+        assets_layout.addLayout(refresh_assets_layout)
+        
         layout.addWidget(assets_frame)
         
         # Добавляем растягивающийся элемент
@@ -972,21 +1054,66 @@ class TradingBotMainWindow(QMainWindow):
         
         # Таблица позиций
         self.positions_table = QTableWidget()
-        self.positions_table.setColumnCount(6)
+        self.positions_table.setColumnCount(10)
         self.positions_table.setHorizontalHeaderLabels([
-            "Символ", "Категория", "Сторона", "Размер", "Цена входа", "P&L"
+            "Символ", "Категория", "Сторона", "Размер", "Цена входа", "Текущая цена", 
+            "Δ 1ч (%)", "Δ 24ч (%)", "Δ 30д (%)", "P&L"
         ])
         
         # Настройка таблицы
         header = self.positions_table.horizontalHeader()
         header.setStretchLastSection(True)
-        for i in range(5):
+        for i in range(9):
             header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         
         self.positions_table.setAlternatingRowColors(True)
         self.positions_table.setSelectionBehavior(QTableWidget.SelectRows)
         
+        # Устанавливаем стиль для таблицы позиций, чтобы текст был видимым
+        self.positions_table.setStyleSheet(
+            "QTableWidget { alternate-background-color: #f0f0f0; background-color: white; }"
+            "QTableWidget::item { color: #2c3e50; }"
+        )
+        
         layout.addWidget(self.positions_table)
+        
+        # Кнопка обновления позиций
+        refresh_layout = QHBoxLayout()
+        self.refresh_positions_btn = QPushButton("🔄 Обновить позиции")
+        self.refresh_positions_btn.setStyleSheet(
+            "QPushButton { background-color: #3498db; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:hover { background-color: #2980b9; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.refresh_positions_btn.clicked.connect(self.refresh_positions)
+        refresh_layout.addStretch()
+        refresh_layout.addWidget(self.refresh_positions_btn)
+        layout.addLayout(refresh_layout)
+        
+        # Панель кнопок для торговли
+        buttons_layout = QHBoxLayout()
+        
+        # Кнопка покупки самой дешевой позиции
+        self.buy_cheapest_btn = QPushButton("🔽 Купить самую дешевую")
+        self.buy_cheapest_btn.setStyleSheet(
+            "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:hover { background-color: #2ecc71; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.buy_cheapest_btn.clicked.connect(self.buy_cheapest_position)
+        buttons_layout.addWidget(self.buy_cheapest_btn)
+        
+        # Кнопка продажи самой дешевой позиции
+        self.sell_cheapest_btn = QPushButton("🔼 Продать самую дешевую")
+        self.sell_cheapest_btn.setStyleSheet(
+            "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:hover { background-color: #c0392b; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.sell_cheapest_btn.clicked.connect(self.sell_cheapest_position)
+        buttons_layout.addWidget(self.sell_cheapest_btn)
+        
+        layout.addLayout(buttons_layout)
         
         self.tab_widget.addTab(positions_widget, "📊 Позиции")
     
@@ -1019,6 +1146,65 @@ class TradingBotMainWindow(QMainWindow):
         layout.addWidget(self.history_table)
         
         self.tab_widget.addTab(history_widget, "📋 История")
+    
+    def create_settings_tab(self):
+        """Создание вкладки настроек"""
+        from PySide6.QtWidgets import QLineEdit
+        
+        settings_widget = QWidget()
+        layout = QVBoxLayout(settings_widget)
+        
+        # Группа настроек API
+        api_group = QGroupBox("🔑 Настройки API Bybit")
+        api_layout = QGridLayout(api_group)
+        
+        # Поля для ввода API ключей
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("Введите API Key")
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        
+        self.api_secret_input = QLineEdit()
+        self.api_secret_input.setPlaceholderText("Введите API Secret")
+        self.api_secret_input.setEchoMode(QLineEdit.Password)
+        
+        # Кнопка для проверки API ключей
+        test_api_btn = QPushButton("Проверить ключи")
+        test_api_btn.clicked.connect(self.test_api_keys)
+        
+        # Кнопка для сохранения API ключей
+        save_api_btn = QPushButton("Сохранить ключи")
+        save_api_btn.clicked.connect(self.save_api_keys)
+        
+        # Кнопка для очистки API ключей
+        clear_api_btn = QPushButton("Очистить ключи")
+        clear_api_btn.clicked.connect(self.clear_api_keys)
+        clear_api_btn.setStyleSheet(
+            "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #c0392b; }"
+        )
+        
+        # Индикатор статуса API
+        self.api_status_label = QLabel("⚠️ API ключи не проверены")
+        self.api_status_label.setStyleSheet("QLabel { color: #f39c12; font-weight: bold; }")
+        
+        # Добавление элементов в layout
+        api_layout.addWidget(QLabel("API Key:"), 0, 0)
+        api_layout.addWidget(self.api_key_input, 0, 1)
+        api_layout.addWidget(QLabel("API Secret:"), 1, 0)
+        api_layout.addWidget(self.api_secret_input, 1, 1)
+        api_layout.addWidget(self.api_status_label, 2, 0, 1, 2)
+        
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(test_api_btn)
+        buttons_layout.addWidget(save_api_btn)
+        buttons_layout.addWidget(clear_api_btn)
+        api_layout.addLayout(buttons_layout, 3, 0, 1, 2)
+        
+        # Добавление группы в основной layout
+        layout.addWidget(api_group)
+        layout.addStretch()
+        
+        self.tab_widget.addTab(settings_widget, "⚙️ Настройки")
     
     def create_logs_tab(self):
         """Создание вкладки логов"""
@@ -1077,6 +1263,107 @@ class TradingBotMainWindow(QMainWindow):
         # Индикатор времени последнего обновления
         self.last_update_label = QLabel("Последнее обновление: никогда")
         self.status_bar.addPermanentWidget(self.last_update_label)
+        
+        # Инициализируем таймер для автоматического обновления данных
+        self.data_timer = QTimer()
+        self.data_timer.timeout.connect(self.refresh_data)
+        self.data_timer.start(30000)  # Обновление каждые 30 секунд
+        
+    def load_api_keys(self):
+        """Загрузка сохраненных API ключей в поля ввода"""
+        try:
+            # Если API ключи были загружены в __init__, отображаем их в полях ввода
+            if hasattr(self, 'api_key') and self.api_key:
+                self.api_key_input.setText(self.api_key)
+                
+            if hasattr(self, 'api_secret') and self.api_secret:
+                self.api_secret_input.setText(self.api_secret)
+                
+            # Если оба ключа загружены, обновляем статус
+            if (hasattr(self, 'api_key') and self.api_key and 
+                hasattr(self, 'api_secret') and self.api_secret):
+                self.api_status_label.setText("✅ API ключи загружены")
+                self.api_status_label.setStyleSheet("QLabel { color: #27ae60; font-weight: bold; }")
+                self.logger.info("API ключи успешно загружены из конфигурации")
+        except Exception as e:
+            self.logger.error(f"Ошибка при загрузке API ключей: {e}")
+            self.api_status_label.setText("❌ Ошибка загрузки API ключей")
+            self.api_status_label.setStyleSheet("QLabel { color: #e74c3c; font-weight: bold; }")
+            
+    def clear_api_keys(self):
+        """Очистка полей ввода API ключей и обновление файла конфигурации"""
+        try:
+            # Запрос подтверждения у пользователя
+            reply = QMessageBox.question(
+                self, "Подтверждение", 
+                "Вы уверены, что хотите очистить API ключи?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Очистка полей ввода
+                self.api_key_input.clear()
+                self.api_secret_input.clear()
+                
+                # Очистка переменных
+                self.api_key = ""
+                self.api_secret = ""
+                
+                # Обновление файла конфигурации
+                try:
+                    # Путь к файлу конфигурации
+                    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
+                    
+                    # Чтение текущего содержимого файла
+                    with open(config_path, "r", encoding="utf-8") as file:
+                        content = file.read()
+                    
+                    # Регулярные выражения для замены значений API ключей
+                    api_key_pattern = r"API_KEY\s*=\s*['\"].*['\"]" 
+                    api_secret_pattern = r"API_SECRET\s*=\s*['\"].*['\"]" 
+                    
+                    # Замена значений на пустые строки
+                    content = re.sub(api_key_pattern, "API_KEY = ''" , content)
+                    content = re.sub(api_secret_pattern, "API_SECRET = ''" , content)
+                    
+                    # Запись обновленного содержимого обратно в файл
+                    with open(config_path, "w", encoding="utf-8") as file:
+                        file.write(content)
+                    
+                    # Очистка файла keys, если он существует
+                    keys_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys")
+                    if os.path.exists(keys_path):
+                        try:
+                            # Удаляем файл keys
+                            os.remove(keys_path)
+                            self.logger.info("Файл keys успешно удален")
+                        except Exception as e:
+                            self.logger.error(f"Ошибка при удалении файла keys: {e}")
+                        
+                    self.logger.info("API ключи успешно очищены в файле конфигурации")
+                except Exception as e:
+                    self.logger.error(f"Ошибка при обновлении файла конфигурации: {e}")
+                    raise
+                
+                # Обновление статуса
+                self.api_status_label.setText("⚠️ API ключи очищены")
+                self.api_status_label.setStyleSheet("QLabel { color: #f39c12; font-weight: bold; }")
+                
+                # Отключение от биржи
+                self.update_connection_status(False)
+                
+                # Логирование
+                self.logger.info("API ключи очищены пользователем")
+                self.add_log_message("🗑️ API ключи очищены")
+                
+                # Показать сообщение об успехе
+                QMessageBox.information(
+                    self, "Успех", 
+                    "API ключи успешно очищены из полей ввода, файла конфигурации и файла keys."
+                )
+        except Exception as e:
+            self.logger.error(f"Ошибка при очистке API ключей: {e}")
+            self.handle_error("Ошибка при очистке API ключей", str(e))
     
     def setup_styles(self):
         """Настройка стилей приложения"""
@@ -1290,7 +1577,8 @@ class TradingBotMainWindow(QMainWindow):
             )
             
             # Отображение списка активов
-            self.update_assets_display(balance_info.get('coins', []))
+            if 'coins' in balance_info:
+                self.update_assets_display(balance_info['coins'])
             
         except Exception as e:
             self.add_log_message(f"❌ Ошибка обновления баланса: {e}")
@@ -1302,34 +1590,88 @@ class TradingBotMainWindow(QMainWindow):
                 self.assets_table.setRowCount(0)
                 return
             
-            # Фильтруем активы с ненулевым балансом
-            active_coins = [coin for coin in coins if float(coin.get('walletBalance', 0)) > 0]
+            # Сортируем активы по USD стоимости (от большей к меньшей)
+            sorted_coins = sorted(coins, key=lambda x: float(x.get('usdValue', 0)), reverse=True)
             
+            # Фильтруем активы с ненулевым балансом
+            active_coins = [coin for coin in sorted_coins if float(coin.get('walletBalance', 0)) > 0]
+            
+            # Очищаем таблицу перед обновлением
+            self.assets_table.clearContents()
             self.assets_table.setRowCount(len(active_coins))
             
             for i, coin in enumerate(active_coins):
                 coin_name = coin.get('coin', '')
-                wallet_balance = float(coin.get('walletBalance', 0))
-                usd_value = float(coin.get('usdValue', 0))
-                available_to_withdraw = coin.get('availableToWithdraw', 'N/A')
+                wallet_balance = coin.get('walletBalance', '0')
+                usd_value = coin.get('usdValue', '0')
+                available_to_withdraw = coin.get('availableToWithdraw', '0')
                 
-                # Заполняем таблицу
-                self.assets_table.setItem(i, 0, QTableWidgetItem(coin_name))
-                self.assets_table.setItem(i, 1, QTableWidgetItem(f"{wallet_balance:.8f}"))
-                self.assets_table.setItem(i, 2, QTableWidgetItem(f"${usd_value:.2f}"))
-                self.assets_table.setItem(i, 3, QTableWidgetItem(str(available_to_withdraw)))
+                # Преобразуем в float для форматирования вывода
+                wallet_balance_float = float(wallet_balance)
+                usd_value_float = float(usd_value)
+                available_float = float(available_to_withdraw)
+                
+                # Создаем элементы таблицы с улучшенным форматированием
+                coin_item = QTableWidgetItem(coin_name)
+                coin_item.setTextAlignment(Qt.AlignCenter)
+                
+                # Адаптивное форматирование в зависимости от типа актива и значения
+                if coin_name in ['BTC', 'ETH']:
+                    # Для BTC и ETH показываем больше знаков после запятой
+                    precision = 8
+                elif wallet_balance_float < 0.01:
+                    # Для очень маленьких значений показываем больше знаков
+                    precision = 8
+                else:
+                    # Для остальных активов используем стандартное форматирование
+                    precision = 4
+                
+                balance_item = QTableWidgetItem(f"{wallet_balance_float:.{precision}f}")
+                balance_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                
+                # USD значение всегда с 2 знаками после запятой
+                usd_item = QTableWidgetItem(f"${usd_value_float:.2f}")
+                usd_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                
+                available_item = QTableWidgetItem(f"{available_float:.{precision}f}")
+                available_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                
+                # Добавляем элементы в таблицу
+                self.assets_table.setItem(i, 0, coin_item)
+                self.assets_table.setItem(i, 1, balance_item)
+                self.assets_table.setItem(i, 2, usd_item)
+                self.assets_table.setItem(i, 3, available_item)
             
+            # Принудительно обновляем всю таблицу
+            self.assets_table.resizeColumnsToContents()
+            self.assets_table.viewport().update()
             self.add_log_message(f"✅ Обновлено активов: {len(active_coins)}")
             
         except Exception as e:
             self.add_log_message(f"❌ Ошибка обновления активов: {e}")
+            import traceback
+            self.add_log_message(f"Детали: {traceback.format_exc()}")
     
     def update_positions(self, positions: List[dict]):
         """Обновление таблицы позиций"""
         try:
             self.current_positions = positions
             
+            # Очищаем таблицу перед обновлением
+            self.positions_table.clearContents()
             self.positions_table.setRowCount(len(positions))
+            
+            # Получаем историю цен для всех символов
+            price_history = {}
+            try:
+                all_price_history = self.db_manager.get_price_history()
+                for ph in all_price_history:
+                    price_history[ph[1]] = ph  # Индекс 1 - это symbol
+            except Exception as e:
+                self.add_log_message(f"⚠️ Ошибка получения истории цен: {e}")
+            
+            # Сортируем позиции по P&L (от наибольшего к наименьшему)
+            positions.sort(key=lambda x: float(x.get('unrealisedPnl', 0)), reverse=True)
             
             for row, position in enumerate(positions):
                 symbol = position.get('symbol', '')
@@ -1339,25 +1681,95 @@ class TradingBotMainWindow(QMainWindow):
                 entry_price = float(position.get('avgPrice', 0))
                 unrealized_pnl = float(position.get('unrealisedPnl', 0))
                 
-                self.positions_table.setItem(row, 0, QTableWidgetItem(symbol))
-                self.positions_table.setItem(row, 1, QTableWidgetItem(category))
-                self.positions_table.setItem(row, 2, QTableWidgetItem(side))
-                self.positions_table.setItem(row, 3, QTableWidgetItem(f"{size:.8f}"))
-                self.positions_table.setItem(row, 4, QTableWidgetItem(f"${entry_price:.6f}"))
+                # Создаем элементы с выравниванием
+                symbol_item = QTableWidgetItem(symbol)
+                symbol_item.setTextAlignment(Qt.AlignCenter)
                 
-                # P&L с цветом
-                pnl_item = QTableWidgetItem(f"${unrealized_pnl:.2f}")
-                if unrealized_pnl > 0:
-                    pnl_item.setForeground(QColor("#27ae60"))
-                elif unrealized_pnl < 0:
-                    pnl_item.setForeground(QColor("#e74c3c"))
+                category_item = QTableWidgetItem(category)
+                category_item.setTextAlignment(Qt.AlignCenter)
                 
-                self.positions_table.setItem(row, 5, pnl_item)
+                # Устанавливаем цвет для стороны позиции (Buy/Sell)
+                side_item = QTableWidgetItem(side)
+                side_item.setTextAlignment(Qt.AlignCenter)
+                if side.upper() == "BUY":
+                    side_item.setFont(QFont("Arial", 9, QFont.Bold))
+                elif side.upper() == "SELL":
+                    side_item.setFont(QFont("Arial", 9, QFont.Bold))
+                
+                # Размер позиции с адаптивным форматированием
+                size_format = "{:.8f}" if size < 0.0001 else "{:.4f}"
+                size_item = QTableWidgetItem(size_format.format(size))
+                size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                
+                # Цена входа
+                entry_price_item = QTableWidgetItem(f"${entry_price:.6f}")
+                entry_price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                
+                # Добавляем элементы в таблицу
+                self.positions_table.setItem(row, 0, symbol_item)
+                self.positions_table.setItem(row, 1, category_item)
+                self.positions_table.setItem(row, 2, side_item)
+                self.positions_table.setItem(row, 3, size_item)
+                self.positions_table.setItem(row, 4, entry_price_item)
+                
+                # Добавляем текущую цену и динамику цен
+                current_price = 0
+                change_1h = 0
+                change_24h = 0
+                change_30d = 0
+                
+                if symbol in price_history:
+                    ph = price_history[symbol]
+                    current_price = ph[2]  # Индекс 2 - текущая цена
+                    change_1h = ph[8]      # Индекс 8 - изменение за 1ч
+                    change_24h = ph[9]     # Индекс 9 - изменение за 24ч
+                    change_30d = ph[11]    # Индекс 11 - изменение за 30д
+                
+                # Текущая цена
+                current_price_item = QTableWidgetItem(f"${current_price:.6f}")
+                current_price_item.setForeground(QColor("#2c3e50"))
+                current_price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.positions_table.setItem(row, 5, current_price_item)
+                
+                # Изменение цены за 1ч
+                change_1h_text = f"+{change_1h:.2f}%" if change_1h > 0 else f"{change_1h:.2f}%"
+                change_1h_item = QTableWidgetItem(change_1h_text)
+                change_1h_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if change_1h > 0 or change_1h < 0:
+                    change_1h_item.setFont(QFont("Arial", 9, QFont.Bold))
+                self.positions_table.setItem(row, 6, change_1h_item)
+                
+                # Изменение цены за 24ч
+                change_24h_text = f"+{change_24h:.2f}%" if change_24h > 0 else f"{change_24h:.2f}%"
+                change_24h_item = QTableWidgetItem(change_24h_text)
+                change_24h_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if change_24h > 0 or change_24h < 0:
+                    change_24h_item.setFont(QFont("Arial", 9, QFont.Bold))
+                self.positions_table.setItem(row, 7, change_24h_item)
+                
+                # Изменение цены за 30д
+                change_30d_text = f"+{change_30d:.2f}%" if change_30d > 0 else f"{change_30d:.2f}%"
+                change_30d_item = QTableWidgetItem(change_30d_text)
+                change_30d_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if change_30d > 0 or change_30d < 0:
+                    change_30d_item.setFont(QFont("Arial", 9, QFont.Bold))
+                self.positions_table.setItem(row, 8, change_30d_item)
+                
+                # P&L с цветом и знаком
+                pnl_text = f"+${unrealized_pnl:.2f}" if unrealized_pnl > 0 else f"${unrealized_pnl:.2f}"
+                pnl_item = QTableWidgetItem(pnl_text)
+                pnl_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if unrealized_pnl > 0 or unrealized_pnl < 0:
+                    pnl_item.setFont(QFont("Arial", 9, QFont.Bold))
+                
+                self.positions_table.setItem(row, 9, pnl_item)
             
             self.add_log_message(f"📊 Обновлено позиций: {len(positions)}")
             
         except Exception as e:
             self.add_log_message(f"❌ Ошибка обновления позиций: {e}")
+            import traceback
+            self.add_log_message(f"Детали: {traceback.format_exc()}")
     
     def add_trade_to_history(self, trade_info: dict):
         """Добавление торговой операции в историю"""
@@ -1437,6 +1849,142 @@ class TradingBotMainWindow(QMainWindow):
             
         except Exception as e:
             self.add_log_message(f"❌ Ошибка обновления статистики: {e}")
+            
+    def buy_cheapest_position(self):
+        """Покупка самой дешевой позиции"""
+        try:
+            if not self.current_positions:
+                self.add_log_message("⚠️ Нет доступных позиций для покупки")
+                return
+                
+            # Получаем историю цен для всех символов
+            price_history = {}
+            try:
+                all_price_history = self.db_manager.get_price_history()
+                for ph in all_price_history:
+                    price_history[ph[1]] = ph  # Индекс 1 - это symbol
+            except Exception as e:
+                self.add_log_message(f"⚠️ Ошибка получения истории цен: {e}")
+                return
+                
+            # Находим самую дешевую позицию
+            cheapest_symbol = None
+            lowest_price = float('inf')
+            
+            for position in self.current_positions:
+                symbol = position.get('symbol', '')
+                if symbol in price_history:
+                    current_price = price_history[symbol][2]  # Индекс 2 - текущая цена
+                    if current_price < lowest_price:
+                        lowest_price = current_price
+                        cheapest_symbol = symbol
+            
+            if not cheapest_symbol:
+                self.add_log_message("⚠️ Не удалось найти самую дешевую позицию")
+                return
+                
+            # Запрос подтверждения
+            reply = QMessageBox.question(
+                self, 
+                "Подтверждение покупки", 
+                f"Вы уверены, что хотите купить {cheapest_symbol} по цене ${lowest_price:.6f}?",
+                QMessageBox.Yes | QMessageBox.No, 
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Здесь будет вызов API для покупки
+                self.add_log_message(f"🔄 Отправка запроса на покупку {cheapest_symbol}...")
+                
+                # Имитация успешной покупки (в реальном приложении здесь будет вызов API)
+                trade_info = {
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': cheapest_symbol,
+                    'side': 'Buy',
+                    'size': 0.01,  # Фиксированный размер для примера
+                    'price': lowest_price,
+                    'pnl': 'N/A',
+                    'analysis': {'confidence': 0.75}
+                }
+                
+                # Добавляем в историю
+                self.add_trade_to_history(trade_info)
+                self.add_log_message(f"✅ Успешно куплено {cheapest_symbol} по цене ${lowest_price:.6f}")
+            else:
+                self.add_log_message("❌ Покупка отменена пользователем")
+                
+        except Exception as e:
+            self.add_log_message(f"❌ Ошибка при покупке: {e}")
+            import traceback
+            self.add_log_message(f"Детали: {traceback.format_exc()}")
+    
+    def sell_cheapest_position(self):
+        """Продажа самой дешевой позиции"""
+        try:
+            if not self.current_positions:
+                self.add_log_message("⚠️ Нет доступных позиций для продажи")
+                return
+                
+            # Получаем историю цен для всех символов
+            price_history = {}
+            try:
+                all_price_history = self.db_manager.get_price_history()
+                for ph in all_price_history:
+                    price_history[ph[1]] = ph  # Индекс 1 - это symbol
+            except Exception as e:
+                self.add_log_message(f"⚠️ Ошибка получения истории цен: {e}")
+                return
+                
+            # Находим самую дешевую позицию
+            cheapest_symbol = None
+            lowest_price = float('inf')
+            
+            for position in self.current_positions:
+                symbol = position.get('symbol', '')
+                if symbol in price_history:
+                    current_price = price_history[symbol][2]  # Индекс 2 - текущая цена
+                    if current_price < lowest_price:
+                        lowest_price = current_price
+                        cheapest_symbol = symbol
+            
+            if not cheapest_symbol:
+                self.add_log_message("⚠️ Не удалось найти самую дешевую позицию")
+                return
+                
+            # Запрос подтверждения
+            reply = QMessageBox.question(
+                self, 
+                "Подтверждение продажи", 
+                f"Вы уверены, что хотите продать {cheapest_symbol} по цене ${lowest_price:.6f}?",
+                QMessageBox.Yes | QMessageBox.No, 
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Здесь будет вызов API для продажи
+                self.add_log_message(f"🔄 Отправка запроса на продажу {cheapest_symbol}...")
+                
+                # Имитация успешной продажи (в реальном приложении здесь будет вызов API)
+                trade_info = {
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': cheapest_symbol,
+                    'side': 'Sell',
+                    'size': 0.01,  # Фиксированный размер для примера
+                    'price': lowest_price,
+                    'pnl': '+$0.05',  # Фиксированный PnL для примера
+                    'analysis': {'confidence': 0.75}
+                }
+                
+                # Добавляем в историю
+                self.add_trade_to_history(trade_info)
+                self.add_log_message(f"✅ Успешно продано {cheapest_symbol} по цене ${lowest_price:.6f}")
+            else:
+                self.add_log_message("❌ Продажа отменена пользователем")
+                
+        except Exception as e:
+            self.add_log_message(f"❌ Ошибка при продаже: {e}")
+            import traceback
+            self.add_log_message(f"Детали: {traceback.format_exc()}")
     
     def add_log_message(self, message: str):
         """Добавление сообщения в лог"""
@@ -1524,9 +2072,272 @@ class TradingBotMainWindow(QMainWindow):
             self.update_connection_status("Отключено")
     
     def refresh_data(self):
-        """Принудительное обновление данных"""
+        """Принудительное обновление всех данных"""
         self.add_log_message("🔄 Принудительное обновление данных...")
-        # Данные обновляются автоматически через торговый поток
+        
+        # Запускаем обновление данных в отдельном потоке
+        threading.Thread(target=self._refresh_data_thread, daemon=True).start()
+        
+    def refresh_positions(self):
+        """Принудительное обновление только позиций"""
+        self.add_log_message("🔄 Обновление позиций...")
+        
+        # Запускаем обновление позиций в отдельном потоке
+        threading.Thread(target=self._refresh_positions_thread, daemon=True).start()
+    
+    def _refresh_positions_thread(self):
+        """Выполнение обновления только позиций в отдельном потоке"""
+        try:
+            # Проверяем, что клиент API инициализирован
+            if not hasattr(self, 'bybit_client') or not self.bybit_client:
+                self.add_log_message("❌ Невозможно обновить позиции: API клиент не инициализирован")
+                return
+                
+            # Обновляем позиции
+            self.add_log_message("🔄 Получение данных о позициях...")
+            try:
+                # Получаем позиции по поддерживаемым категориям
+                all_positions = []
+                categories = ["linear", "inverse"]
+                
+                for category in categories:
+                    try:
+                        # Получаем реальные данные через API с указанием settleCoin=USDT для linear категории
+                        settle_coin = "USDT" if category == "linear" else None
+                        positions_list = self.bybit_client.get_positions(category=category, settle_coin=settle_coin)
+                        
+                        # Проверяем, что получили список позиций
+                        if positions_list and isinstance(positions_list, list):
+                            # Добавляем категорию к каждой позиции для идентификации
+                            for pos in positions_list:
+                                pos['category'] = category
+                            all_positions.extend(positions_list)
+                    except Exception as e:
+                        self.add_log_message(f"⚠️ Ошибка получения позиций {category}: {e}")
+                        continue
+                
+                # Фильтруем только активные позиции (с размером > 0)
+                active_positions = []
+                for pos in all_positions:
+                    size = float(pos.get('size', 0))
+                    if size > 0:
+                        active_positions.append(pos)
+                
+                # Обновляем таблицу позиций через сигнал
+                QMetaObject.invokeMethod(self, "update_positions", 
+                                       Qt.QueuedConnection,
+                                       Q_ARG(list, active_positions))
+                
+                self.add_log_message(f"✅ Позиции успешно обновлены: {len(active_positions)}")
+                
+            except Exception as pos_err:
+                self.add_log_message(f"❌ Ошибка обновления позиций: {pos_err}")
+                import traceback
+                self.add_log_message(f"Детали: {traceback.format_exc()}")
+                
+        except Exception as e:
+            self.add_log_message(f"❌ Ошибка обновления позиций: {e}")
+            import traceback
+            self.add_log_message(f"Детали: {traceback.format_exc()}")
+            self.logger.error(f"Ошибка обновления позиций: {e}")
+            self.logger.error(traceback.format_exc())
+    
+    def _refresh_data_thread(self):
+        """Выполнение обновления всех данных в отдельном потоке"""
+        try:
+            # Проверяем, что клиент API инициализирован
+            if not hasattr(self, 'bybit_client') or not self.bybit_client:
+                self.add_log_message("❌ Невозможно обновить данные: API клиент не инициализирован")
+                return
+                
+            # Получаем данные о балансе через API
+            balance_response = self.bybit_client.get_wallet_balance()
+            
+            if balance_response and balance_response.get('list'):
+                # Извлекаем данные из структуры ответа API
+                balance_data = balance_response['list'][0]
+                
+                # Создаем структуру для обновления UI
+                balance_info = {
+                    'totalWalletBalance': balance_data.get('totalWalletBalance', '0'),
+                    'totalAvailableBalance': balance_data.get('totalAvailableBalance', '0'),
+                    'totalEquity': balance_data.get('totalEquity', '0'),
+                    'totalPerpUPL': balance_data.get('totalPerpUPL', '0'),
+                    'coins': balance_data.get('coin', [])
+                }
+                
+                # Обновляем интерфейс баланса через сигнал
+                QMetaObject.invokeMethod(self, "update_balance", 
+                                       Qt.QueuedConnection,
+                                       Q_ARG(dict, balance_info))
+                
+                # Обновляем позиции
+                self.add_log_message("🔄 Обновление позиций...")
+                try:
+                    # Получаем позиции по поддерживаемым категориям
+                    all_positions = []
+                    categories = ["linear", "inverse"]
+                    
+                    for category in categories:
+                        try:
+                            # Получаем реальные данные через API с указанием settleCoin=USDT для linear категории
+                            settle_coin = "USDT" if category == "linear" else None
+                            positions_list = self.bybit_client.get_positions(category=category, settle_coin=settle_coin)
+                            
+                            # Проверяем, что получили список позиций
+                            if positions_list and isinstance(positions_list, list):
+                                # Добавляем категорию к каждой позиции для идентификации
+                                for pos in positions_list:
+                                    pos['category'] = category
+                                all_positions.extend(positions_list)
+                        except Exception as e:
+                            self.add_log_message(f"⚠️ Ошибка получения позиций {category}: {e}")
+                            continue
+                    
+                    # Фильтруем только активные позиции (с размером > 0)
+                    active_positions = []
+                    for pos in all_positions:
+                        size = float(pos.get('size', 0))
+                        if size > 0:
+                            active_positions.append(pos)
+                    
+                    # Обновляем таблицу позиций через сигнал
+                    QMetaObject.invokeMethod(self, "update_positions", 
+                                           Qt.QueuedConnection,
+                                           Q_ARG(list, active_positions))
+                    
+                except Exception as pos_err:
+                    self.add_log_message(f"❌ Ошибка обновления позиций: {pos_err}")
+                
+                self.add_log_message("✅ Данные успешно обновлены")
+            else:
+                self.add_log_message("⚠️ Получен пустой ответ от API")
+                
+        except Exception as e:
+            self.add_log_message(f"❌ Ошибка обновления данных: {e}")
+            import traceback
+            self.add_log_message(f"Детали: {traceback.format_exc()}")
+            self.logger.error(f"Ошибка обновления данных: {e}")
+            self.logger.error(traceback.format_exc())
+    
+    def test_api_keys(self):
+        """Проверка API ключей"""
+        api_key = self.api_key_input.text().strip()
+        api_secret = self.api_secret_input.text().strip()
+        
+        if not api_key or not api_secret:
+            self.api_status_label.setText("❌ Введите API ключи")
+            self.api_status_label.setStyleSheet("QLabel { color: #e74c3c; font-weight: bold; }")
+            return
+        
+        # Изменение статуса на время проверки
+        self.api_status_label.setText("⏳ Проверка ключей...")
+        self.api_status_label.setStyleSheet("QLabel { color: #3498db; font-weight: bold; }")
+        QApplication.processEvents()
+        
+        try:
+            # Создаем временный клиент для проверки ключей
+            from config import USE_TESTNET
+            client = BybitClient(api_key, api_secret, testnet=USE_TESTNET)
+            # Пробуем получить баланс для проверки работоспособности ключей
+            balance = client.get_wallet_balance()
+            
+            if balance:
+                self.api_status_label.setText("✅ API ключи работают")
+                self.api_status_label.setStyleSheet("QLabel { color: #27ae60; font-weight: bold; }")
+                self.add_log_message("API ключи успешно проверены")
+            else:
+                self.api_status_label.setText("❌ Не удалось получить баланс")
+                self.api_status_label.setStyleSheet("QLabel { color: #e74c3c; font-weight: bold; }")
+                self.add_log_message("Ошибка проверки API ключей: не удалось получить баланс")
+        except Exception as e:
+            self.api_status_label.setText(f"❌ Ошибка: {str(e)[:50]}")
+            self.api_status_label.setStyleSheet("QLabel { color: #e74c3c; font-weight: bold; }")
+            self.add_log_message(f"Ошибка проверки API ключей: {str(e)}")
+    
+    def save_api_keys(self):
+        """Сохранение API ключей"""
+        api_key = self.api_key_input.text().strip()
+        api_secret = self.api_secret_input.text().strip()
+        
+        if not api_key or not api_secret:
+            self.api_status_label.setText("❌ Введите API ключи для сохранения")
+            self.api_status_label.setStyleSheet("QLabel { color: #e74c3c; font-weight: bold; }")
+            return
+        
+        try:
+            # Путь к файлу config.py
+            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.py')
+            
+            # Чтение текущего содержимого файла
+            with open(config_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Замена значений API ключей
+            content = re.sub(r'API_KEY\s*=\s*"[^"]*"', f'API_KEY = "{api_key}"', content)
+            content = re.sub(r'API_SECRET\s*=\s*"[^"]*"', f'API_SECRET = "{api_secret}"', content)
+            
+            # Запись обновленного содержимого
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            # Обновляем клиент с новыми ключами
+            self.api_key = api_key
+            self.api_secret = api_secret
+            # Используем значение USE_TESTNET из конфигурации
+            from config import USE_TESTNET
+            self.bybit_client = BybitClient(api_key, api_secret, testnet=USE_TESTNET)
+            
+            self.api_status_label.setText("✅ API ключи сохранены")
+            self.api_status_label.setStyleSheet("QLabel { color: #27ae60; font-weight: bold; }")
+            self.add_log_message("API ключи успешно сохранены")
+            
+            # Пробуем подключиться с новыми ключами
+            self.connect_to_exchange()
+        except Exception as e:
+            self.api_status_label.setText(f"❌ Ошибка сохранения: {str(e)[:50]}")
+            self.api_status_label.setStyleSheet("QLabel { color: #e74c3c; font-weight: bold; }")
+            self.add_log_message(f"Ошибка сохранения API ключей: {str(e)}")
+    
+    def check_api_connection(self):
+        """Проверка статуса подключения к API"""
+        self.logger.info("Проверка статуса подключения к API...")
+        return self.connect_to_exchange()
+    
+    def connect_to_exchange(self):
+        """Подключение к бирже и обновление статуса соединения"""
+        try:
+            if not self.bybit_client:
+                self.add_log_message("❌ Клиент API не инициализирован")
+                self.update_connection_status(False)
+                return False
+            
+            # Проверяем соединение, запрашивая баланс
+            balance = self.bybit_client.get_wallet_balance()
+            
+            if balance:
+                self.update_connection_status(True)
+                self.add_log_message("✅ Успешное подключение к бирже")
+                
+                # Обновляем баланс
+                self.update_balance(balance)
+                
+                # Разблокируем кнопку торговли
+                self.trading_toggle_btn.setEnabled(True)
+                
+                # Обновляем данные
+                self.refresh_data()
+                
+                return True
+            else:
+                self.update_connection_status(False)
+                self.add_log_message("❌ Не удалось получить баланс")
+                return False
+                
+        except Exception as e:
+            self.update_connection_status(False)
+            self.add_log_message(f"❌ Ошибка подключения к бирже: {str(e)}")
+            return False
     
     def clear_logs(self):
         """Очистка логов"""

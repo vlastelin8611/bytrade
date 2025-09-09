@@ -39,7 +39,7 @@ class PortfolioDataWorker(QThread):
     
     def run(self):
         """
-        Получение данных портфеля
+        Получение данных портфеля и торговых инструментов
         """
         try:
             # Проверяем наличие API клиента
@@ -48,8 +48,65 @@ class PortfolioDataWorker(QThread):
                 self.data_received.emit({})
                 return
             
-            # Здесь будет реальное получение данных через API
-            # Пока возвращаем пустые данные до настройки API
+            # Получаем торговые инструменты
+            instruments_data = []
+            try:
+                instruments_response = self.api_client.get_instruments_info()
+                if instruments_response and 'result' in instruments_response:
+                    instruments_list = instruments_response['result'].get('list', [])
+                    # Фильтруем только USDT пары для упрощения
+                    instruments_data = [inst for inst in instruments_list if 'USDT' in inst.get('symbol', '')]
+                    
+                    # Получаем тикеры для актуальных цен
+                    tickers_response = self.api_client.get_tickers()
+                    if tickers_response and 'result' in tickers_response:
+                        tickers_list = tickers_response['result'].get('list', [])
+                        tickers_dict = {ticker['symbol']: ticker for ticker in tickers_list}
+                        
+                        # Объединяем данные инструментов с тикерами
+                        for instrument in instruments_data:
+                            symbol = instrument.get('symbol')
+                            if symbol in tickers_dict:
+                                ticker_data = tickers_dict[symbol]
+                                instrument.update({
+                                    'lastPrice': ticker_data.get('lastPrice', '0'),
+                                    'price24hPcnt': ticker_data.get('price24hPcnt', '0'),
+                                    'volume24h': ticker_data.get('volume24h', '0')
+                                })
+            except Exception as e:
+                logging.error(f"Ошибка получения торговых инструментов: {e}")
+            
+            # Получаем данные баланса
+            wallet_data = {}
+            try:
+                wallet_response = self.api_client.get_wallet_balance()
+                if wallet_response and 'result' in wallet_response:
+                    wallet_data = wallet_response['result']
+            except Exception as e:
+                logging.error(f"Ошибка получения баланса: {e}")
+            
+            # Получаем историю ордеров
+            recent_trades = []
+            try:
+                order_history = self.api_client.get_order_history()
+                if order_history:
+                    for order in order_history:
+                        # Преобразуем данные ордера в формат для отображения
+                        trade = {
+                            "timestamp": datetime.fromtimestamp(int(order.get("createdTime", 0)) / 1000),
+                            "symbol": order.get("symbol", ""),
+                            "side": order.get("side", ""),
+                            "size": float(order.get("qty", 0)),
+                            "price": float(order.get("avgPrice", 0)),
+                            "realized_pnl": float(order.get("closedPnl", 0)),
+                            "fee": float(order.get("cumExecFee", 0)),
+                            "order_id": order.get("orderId", ""),
+                            "status": order.get("orderStatus", "")
+                        }
+                        recent_trades.append(trade)
+            except Exception as e:
+                logging.error(f"Ошибка получения истории ордеров: {e}")
+            
             portfolio_data = {
                 "total_balance": 0.0,
                 "available_balance": 0.0,
@@ -58,8 +115,8 @@ class PortfolioDataWorker(QThread):
                 "total_equity": 0.0,
                 "margin_used": 0.0,
                 "margin_ratio": 0.0,
-                "positions": [],
-                "recent_trades": [],
+                "instruments": instruments_data,  # Заменили positions на instruments
+                "recent_trades": recent_trades,
                 "asset_distribution": {},
                 "performance_history": []
             }
@@ -337,47 +394,51 @@ class PortfolioTab(QWidget):
     
     def _create_positions_tab(self, parent):
         """
-        Создание вкладки позиций
+        Создание вкладки торговых инструментов
         """
         layout = QVBoxLayout(parent)
         
-        # Фильтры
+        # Фильтры и управление
         filters_layout = QHBoxLayout()
         
         filters_layout.addWidget(QLabel("Фильтр:"))
         
         self.position_filter_combo = QComboBox()
-        self.position_filter_combo.addItems(["Все позиции", "Прибыльные", "Убыточные", "Длинные", "Короткие"])
-        self.position_filter_combo.currentTextChanged.connect(self._filter_positions)
+        self.position_filter_combo.addItems(["Все инструменты", "По цене (возрастание)", "По цене (убывание)", "По объему", "Только USDT"])
+        self.position_filter_combo.currentTextChanged.connect(self._filter_instruments)
         filters_layout.addWidget(self.position_filter_combo)
         
         filters_layout.addStretch()
         
-        self.close_all_button = QPushButton("Закрыть все")
-        self.close_all_button.clicked.connect(self._close_all_positions)
-        filters_layout.addWidget(self.close_all_button)
+        # Кнопка покупки самого дешевого
+        self.buy_cheapest_button = QPushButton("Купить самый дешевый")
+        self.buy_cheapest_button.clicked.connect(self._buy_cheapest_asset)
+        filters_layout.addWidget(self.buy_cheapest_button)
+        
+        # Кнопка обновления
+        self.refresh_instruments_button = QPushButton("Обновить")
+        self.refresh_instruments_button.clicked.connect(self._refresh_instruments)
+        filters_layout.addWidget(self.refresh_instruments_button)
         
         layout.addLayout(filters_layout)
         
-        # Таблица позиций
+        # Таблица торговых инструментов
         self.positions_table = QTableWidget()
-        self.positions_table.setColumnCount(9)
+        self.positions_table.setColumnCount(7)
         self.positions_table.setHorizontalHeaderLabels([
-            "Символ", "Направление", "Размер", "Цена входа", 
-            "Текущая цена", "P&L", "P&L %", "Маржа", "Действия"
+            "Символ", "Текущая цена", "Изменение 24ч", "Объем 24ч", 
+            "Мин. размер", "Статус", "Действия"
         ])
         
         # Настройка таблицы
         header = self.positions_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Символ
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Цена
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Изменение 24ч
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Объем 24ч
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Мин. размер
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Статус
+        header.setSectionResizeMode(6, QHeaderView.Stretch)           # Действия
         
         self.positions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.positions_table.setAlternatingRowColors(True)
@@ -587,93 +648,125 @@ class PortfolioTab(QWidget):
     
     def _update_positions_table(self):
         """
-        Обновление таблицы позиций
+        Обновление таблицы торговых инструментов
         """
         try:
-            positions = self.portfolio_data.get("positions", [])
-            self.positions_table.setRowCount(len(positions))
+            # Получаем данные о торговых инструментах
+            instruments = self.portfolio_data.get("instruments", [])
             
-            for row, position in enumerate(positions):
+            if not instruments:
+                # Если инструментов нет, показываем сообщение
+                self.positions_table.setRowCount(1)
+                no_instruments_item = QTableWidgetItem("Загрузка торговых инструментов...")
+                no_instruments_item.setTextAlignment(Qt.AlignCenter)
+                self.positions_table.setItem(0, 0, no_instruments_item)
+                # Объединяем все колонки для сообщения
+                self.positions_table.setSpan(0, 0, 1, 7)
+                return
+            
+            self.positions_table.setRowCount(len(instruments))
+            
+            for row, instrument in enumerate(instruments):
                 # Символ
-                self.positions_table.setItem(row, 0, QTableWidgetItem(position.get("symbol", "")))
-                
-                # Направление
-                side_item = QTableWidgetItem(position.get("side", ""))
-                if position.get("side") == "Buy":
-                    side_item.setForeground(Qt.green)
-                else:
-                    side_item.setForeground(Qt.red)
-                self.positions_table.setItem(row, 1, side_item)
-                
-                # Размер
-                self.positions_table.setItem(row, 2, QTableWidgetItem(f"{position.get('size', 0)}"))
-                
-                # Цена входа
-                self.positions_table.setItem(row, 3, QTableWidgetItem(f"${position.get('entry_price', 0):,.2f}"))
+                symbol_item = QTableWidgetItem(instrument.get("symbol", ""))
+                symbol_item.setFont(QFont("Arial", 9, QFont.Bold))
+                self.positions_table.setItem(row, 0, symbol_item)
                 
                 # Текущая цена
-                self.positions_table.setItem(row, 4, QTableWidgetItem(f"${position.get('mark_price', 0):,.2f}"))
+                price = float(instrument.get("lastPrice", 0))
+                price_item = QTableWidgetItem(f"${price:,.6f}" if price < 1 else f"${price:,.2f}")
+                self.positions_table.setItem(row, 1, price_item)
                 
-                # P&L
-                pnl = position.get("unrealized_pnl", 0)
-                pnl_item = QTableWidgetItem(f"${pnl:+,.2f}")
-                if pnl >= 0:
-                    pnl_item.setForeground(Qt.green)
+                # Изменение за 24ч
+                change_24h = float(instrument.get("price24hPcnt", 0)) * 100
+                change_item = QTableWidgetItem(f"{change_24h:+.2f}%")
+                if change_24h >= 0:
+                    change_item.setForeground(Qt.green)
                 else:
-                    pnl_item.setForeground(Qt.red)
-                self.positions_table.setItem(row, 5, pnl_item)
+                    change_item.setForeground(Qt.red)
+                self.positions_table.setItem(row, 2, change_item)
                 
-                # P&L %
-                pnl_pct = position.get("pnl_percentage", 0)
-                pnl_pct_item = QTableWidgetItem(f"{pnl_pct:+.2f}%")
-                if pnl_pct >= 0:
-                    pnl_pct_item.setForeground(Qt.green)
+                # Объем за 24ч
+                volume_24h = float(instrument.get("volume24h", 0))
+                volume_item = QTableWidgetItem(f"{volume_24h:,.0f}")
+                self.positions_table.setItem(row, 3, volume_item)
+                
+                # Минимальный размер ордера
+                min_order_qty = instrument.get("lotSizeFilter", {}).get("minOrderQty", "N/A")
+                min_size_item = QTableWidgetItem(str(min_order_qty))
+                self.positions_table.setItem(row, 4, min_size_item)
+                
+                # Статус
+                status = instrument.get("status", "Unknown")
+                status_item = QTableWidgetItem(status)
+                if status == "Trading":
+                    status_item.setForeground(Qt.green)
                 else:
-                    pnl_pct_item.setForeground(Qt.red)
-                self.positions_table.setItem(row, 6, pnl_pct_item)
-                
-                # Маржа
-                self.positions_table.setItem(row, 7, QTableWidgetItem(f"${position.get('margin', 0):,.2f}"))
+                    status_item.setForeground(Qt.red)
+                self.positions_table.setItem(row, 5, status_item)
                 
                 # Действия
                 actions_widget = QWidget()
                 actions_layout = QHBoxLayout(actions_widget)
                 actions_layout.setContentsMargins(5, 2, 5, 2)
                 
-                close_btn = QPushButton("Закрыть")
-                close_btn.setMaximumWidth(60)
-                close_btn.clicked.connect(lambda checked, pos=position: self._close_position(pos))
-                actions_layout.addWidget(close_btn)
+                buy_btn = QPushButton("Купить")
+                buy_btn.setMaximumWidth(60)
+                buy_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+                buy_btn.clicked.connect(lambda checked, sym=instrument.get("symbol"): self._buy_instrument(sym))
+                actions_layout.addWidget(buy_btn)
                 
-                modify_btn = QPushButton("Изменить")
-                modify_btn.setMaximumWidth(70)
-                modify_btn.clicked.connect(lambda checked, pos=position: self._modify_position(pos))
-                actions_layout.addWidget(modify_btn)
+                sell_btn = QPushButton("Продать")
+                sell_btn.setMaximumWidth(60)
+                sell_btn.setStyleSheet("QPushButton { background-color: #f44336; color: white; }")
+                sell_btn.clicked.connect(lambda checked, sym=instrument.get("symbol"): self._sell_instrument(sym))
+                actions_layout.addWidget(sell_btn)
                 
-                self.positions_table.setCellWidget(row, 8, actions_widget)
+                self.positions_table.setCellWidget(row, 6, actions_widget)
         
         except Exception as e:
-            self.logger.error(f"Ошибка обновления таблицы позиций: {e}")
+            self.logger.error(f"Ошибка обновления таблицы торговых инструментов: {e}")
     
     def _update_trades_table(self):
         """
-        Обновление таблицы сделок
+        Обновление таблицы сделок всеми доступными сделками
         """
         try:
             trades = self.portfolio_data.get("recent_trades", [])
+            self._populate_trades_table(trades)
+        except Exception as e:
+            self.logger.error(f"Ошибка обновления таблицы сделок: {e}")
+    
+    def _update_filtered_trades_table(self):
+        """
+        Обновление таблицы сделок отфильтрованными сделками
+        """
+        try:
+            if hasattr(self, 'filtered_trades'):
+                self._populate_trades_table(self.filtered_trades)
+            else:
+                self._update_trades_table()
+        except Exception as e:
+            self.logger.error(f"Ошибка обновления таблицы отфильтрованных сделок: {e}")
+    
+    def _populate_trades_table(self, trades):
+        """
+        Заполнение таблицы сделок данными
+        """
+        try:
             self.trades_table.setRowCount(len(trades))
             
             for row, trade in enumerate(trades):
                 # Время
                 timestamp = trade.get("timestamp", datetime.now())
-                self.trades_table.setItem(row, 0, QTableWidgetItem(timestamp.strftime("%H:%M:%S")))
+                self.trades_table.setItem(row, 0, QTableWidgetItem(timestamp.strftime("%Y-%m-%d %H:%M:%S")))
                 
                 # Символ
                 self.trades_table.setItem(row, 1, QTableWidgetItem(trade.get("symbol", "")))
                 
                 # Направление
                 side_item = QTableWidgetItem(trade.get("side", ""))
-                if trade.get("side") == "Buy":
+                if trade.get("side").lower() == "buy":
                     side_item.setForeground(Qt.green)
                 else:
                     side_item.setForeground(Qt.red)
@@ -965,22 +1058,394 @@ class PortfolioTab(QWidget):
         except Exception as e:
             self.logger.error(f"Ошибка закрытия всех позиций: {e}")
     
-    def _filter_positions(self):
+    def _filter_instruments(self):
         """
-        Фильтрация позиций
+        Фильтрация торговых инструментов
         """
-        # В реальной реализации здесь будет фильтрация таблицы
-        filter_text = self.position_filter_combo.currentText()
-        self.logger.info(f"Применен фильтр позиций: {filter_text}")
+        filter_type = self.position_filter_combo.currentText()
+        instruments = self.portfolio_data.get("instruments", [])
+        
+        if filter_type == "По цене (возрастание)":
+            instruments.sort(key=lambda x: float(x.get("lastPrice", 0)))
+        elif filter_type == "По цене (убывание)":
+            instruments.sort(key=lambda x: float(x.get("lastPrice", 0)), reverse=True)
+        elif filter_type == "По объему":
+            instruments.sort(key=lambda x: float(x.get("volume24h", 0)), reverse=True)
+        elif filter_type == "Только USDT":
+            instruments = [inst for inst in instruments if "USDT" in inst.get("symbol", "")]
+        
+        self.portfolio_data["instruments"] = instruments
+        self._update_positions_table()
+        self.logger.info(f"Применен фильтр инструментов: {filter_type}")
+    
+    def _buy_cheapest_asset(self):
+        """
+        Покупка самого дешевого актива
+        """
+        try:
+            instruments = self.portfolio_data.get("instruments", [])
+            if not instruments:
+                QMessageBox.warning(self, "Предупреждение", "Нет доступных инструментов")
+                return
+            
+            # Находим самый дешевый актив
+            cheapest = min(instruments, key=lambda x: float(x.get("lastPrice", float('inf'))))
+            symbol = cheapest.get("symbol", "")
+            price = float(cheapest.get("lastPrice", 0))
+            
+            reply = QMessageBox.question(
+                self, "Покупка актива",
+                f"Купить {symbol} по цене ${price:.6f}?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self._buy_instrument(symbol)
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка покупки самого дешевого актива: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось купить актив: {e}")
+    
+    def _refresh_instruments(self):
+        """
+        Обновление списка торговых инструментов
+        """
+        self._refresh_data()
+        self.logger.info("Обновление списка торговых инструментов")
+    
+    def _buy_instrument(self, symbol):
+        """
+        Покупка инструмента
+        """
+        try:
+            # Получаем текущую цену инструмента
+            instruments = self.portfolio_data.get("instruments", [])
+            instrument = next((i for i in instruments if i.get("symbol") == symbol), None)
+            
+            if not instrument:
+                QMessageBox.warning(self, "Предупреждение", f"Не удалось найти инструмент {symbol}")
+                return
+            
+            # Получаем текущую цену
+            current_price = float(instrument.get("lastPrice", 0))
+            if current_price <= 0:
+                QMessageBox.warning(self, "Предупреждение", f"Некорректная цена для {symbol}: {current_price}")
+                return
+            
+            # Диалог для ввода количества
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Покупка {symbol}")
+            dialog.setMinimumWidth(300)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Информация о цене
+            price_label = QLabel(f"Текущая цена: ${current_price:,.6f}")
+            layout.addWidget(price_label)
+            
+            # Поле для ввода количества
+            qty_layout = QHBoxLayout()
+            qty_label = QLabel("Количество:")
+            qty_input = QLineEdit()
+            qty_layout.addWidget(qty_label)
+            qty_layout.addWidget(qty_input)
+            layout.addLayout(qty_layout)
+            
+            # Поле для ввода суммы в USD
+            usd_layout = QHBoxLayout()
+            usd_label = QLabel("Сумма в USD:")
+            usd_input = QLineEdit()
+            usd_layout.addWidget(usd_label)
+            usd_layout.addWidget(usd_input)
+            layout.addLayout(usd_layout)
+            
+            # Связываем поля количества и суммы
+            def update_usd():
+                try:
+                    qty = float(qty_input.text() or "0")
+                    usd_input.setText(f"{qty * current_price:.2f}")
+                except ValueError:
+                    pass
+            
+            def update_qty():
+                try:
+                    usd = float(usd_input.text() or "0")
+                    qty_input.setText(f"{usd / current_price:.6f}")
+                except ValueError:
+                    pass
+            
+            qty_input.textChanged.connect(update_usd)
+            usd_input.textChanged.connect(update_qty)
+            
+            # Кнопки
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            
+            # Показываем диалог
+            if dialog.exec() != QDialog.Accepted:
+                return
+            
+            # Получаем введенное количество
+            try:
+                qty = float(qty_input.text())
+                if qty <= 0:
+                    QMessageBox.warning(self, "Предупреждение", "Количество должно быть больше нуля")
+                    return
+            except ValueError:
+                QMessageBox.warning(self, "Предупреждение", "Введите корректное количество")
+                return
+            
+            # Минимальный размер ордера
+            min_order_qty = float(instrument.get("lotSizeFilter", {}).get("minOrderQty", 0))
+            if qty < min_order_qty:
+                QMessageBox.warning(self, "Предупреждение", 
+                                  f"Минимальный размер ордера: {min_order_qty}")
+                return
+            
+            # Подтверждение
+            reply = QMessageBox.question(
+                self, "Подтверждение",
+                f"Вы уверены, что хотите купить {qty} {symbol} по цене ${current_price:,.6f}?\n"
+                f"Общая сумма: ${qty * current_price:,.2f}",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Размещаем ордер через API
+            api_client = self.main_window.api_client
+            if not api_client:
+                QMessageBox.warning(self, "Предупреждение", "API клиент не инициализирован")
+                return
+            
+            # Преобразуем количество в строку с нужной точностью
+            qty_str = f"{qty:.6f}".rstrip('0').rstrip('.') if '.' in f"{qty:.6f}" else f"{qty:.0f}"
+            
+            # Размещаем рыночный ордер на покупку
+            response = api_client.place_order(
+                symbol=symbol,
+                side="Buy",
+                order_type="Market",
+                qty=qty_str
+            )
+            
+            if response and response.get("retCode") == 0:
+                QMessageBox.information(
+                    self, "Успех", 
+                    f"Ордер на покупку {qty} {symbol} успешно размещен"
+                )
+                self.logger.info(f"Успешная покупка {qty} {symbol}")
+                
+                # Обновляем данные
+                self._refresh_data()
+            else:
+                error_msg = response.get("retMsg", "Неизвестная ошибка") if response else "Нет ответа от API"
+                QMessageBox.critical(
+                    self, "Ошибка", 
+                    f"Не удалось разместить ордер: {error_msg}"
+                )
+                self.logger.error(f"Ошибка размещения ордера на покупку {symbol}: {error_msg}")
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка покупки инструмента {symbol}: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось купить {symbol}: {e}")
+    
+    def _sell_instrument(self, symbol):
+        """
+        Продажа инструмента
+        """
+        try:
+            # Получаем текущую цену инструмента
+            instruments = self.portfolio_data.get("instruments", [])
+            instrument = next((i for i in instruments if i.get("symbol") == symbol), None)
+            
+            if not instrument:
+                QMessageBox.warning(self, "Предупреждение", f"Не удалось найти инструмент {symbol}")
+                return
+            
+            # Получаем текущую цену
+            current_price = float(instrument.get("lastPrice", 0))
+            if current_price <= 0:
+                QMessageBox.warning(self, "Предупреждение", f"Некорректная цена для {symbol}: {current_price}")
+                return
+            
+            # Получаем доступное количество для продажи
+            positions = self.portfolio_data.get("positions", [])
+            position = next((p for p in positions if p.get("symbol") == symbol), None)
+            
+            available_qty = 0
+            if position:
+                available_qty = float(position.get("size", 0))
+            
+            if available_qty <= 0:
+                QMessageBox.warning(self, "Предупреждение", f"У вас нет доступных позиций по {symbol} для продажи")
+                return
+            
+            # Диалог для ввода количества
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Продажа {symbol}")
+            dialog.setMinimumWidth(300)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Информация о цене и доступном количестве
+            price_label = QLabel(f"Текущая цена: ${current_price:,.6f}")
+            layout.addWidget(price_label)
+            
+            available_label = QLabel(f"Доступно для продажи: {available_qty}")
+            layout.addWidget(available_label)
+            
+            # Поле для ввода количества
+            qty_layout = QHBoxLayout()
+            qty_label = QLabel("Количество:")
+            qty_input = QLineEdit()
+            qty_input.setText(str(available_qty))  # По умолчанию продаем все
+            qty_layout.addWidget(qty_label)
+            qty_layout.addWidget(qty_input)
+            layout.addLayout(qty_layout)
+            
+            # Поле для ввода суммы в USD
+            usd_layout = QHBoxLayout()
+            usd_label = QLabel("Сумма в USD:")
+            usd_input = QLineEdit()
+            usd_input.setText(f"{available_qty * current_price:.2f}")  # Расчет суммы
+            usd_layout.addWidget(usd_label)
+            usd_layout.addWidget(usd_input)
+            layout.addLayout(usd_layout)
+            
+            # Связываем поля количества и суммы
+            def update_usd():
+                try:
+                    qty = float(qty_input.text() or "0")
+                    usd_input.setText(f"{qty * current_price:.2f}")
+                except ValueError:
+                    pass
+            
+            def update_qty():
+                try:
+                    usd = float(usd_input.text() or "0")
+                    qty_input.setText(f"{usd / current_price:.6f}")
+                except ValueError:
+                    pass
+            
+            qty_input.textChanged.connect(update_usd)
+            usd_input.textChanged.connect(update_qty)
+            
+            # Кнопки
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            
+            # Показываем диалог
+            if dialog.exec() != QDialog.Accepted:
+                return
+            
+            # Получаем введенное количество
+            try:
+                qty = float(qty_input.text())
+                if qty <= 0:
+                    QMessageBox.warning(self, "Предупреждение", "Количество должно быть больше нуля")
+                    return
+                
+                if qty > available_qty:
+                    QMessageBox.warning(self, "Предупреждение", 
+                                      f"Вы не можете продать больше, чем имеете ({available_qty})")
+                    return
+            except ValueError:
+                QMessageBox.warning(self, "Предупреждение", "Введите корректное количество")
+                return
+            
+            # Минимальный размер ордера
+            min_order_qty = float(instrument.get("lotSizeFilter", {}).get("minOrderQty", 0))
+            if qty < min_order_qty:
+                QMessageBox.warning(self, "Предупреждение", 
+                                  f"Минимальный размер ордера: {min_order_qty}")
+                return
+            
+            # Подтверждение
+            reply = QMessageBox.question(
+                self, "Подтверждение",
+                f"Вы уверены, что хотите продать {qty} {symbol} по цене ${current_price:,.6f}?\n"
+                f"Общая сумма: ${qty * current_price:,.2f}",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Размещаем ордер через API
+            api_client = self.main_window.api_client
+            if not api_client:
+                QMessageBox.warning(self, "Предупреждение", "API клиент не инициализирован")
+                return
+            
+            # Преобразуем количество в строку с нужной точностью
+            qty_str = f"{qty:.6f}".rstrip('0').rstrip('.') if '.' in f"{qty:.6f}" else f"{qty:.0f}"
+            
+            # Размещаем рыночный ордер на продажу
+            response = api_client.place_order(
+                symbol=symbol,
+                side="Sell",
+                order_type="Market",
+                qty=qty_str
+            )
+            
+            if response and response.get("retCode") == 0:
+                QMessageBox.information(
+                    self, "Успех", 
+                    f"Ордер на продажу {qty} {symbol} успешно размещен"
+                )
+                self.logger.info(f"Успешная продажа {qty} {symbol}")
+                
+                # Обновляем данные
+                self._refresh_data()
+            else:
+                error_msg = response.get("retMsg", "Неизвестная ошибка") if response else "Нет ответа от API"
+                QMessageBox.critical(
+                    self, "Ошибка", 
+                    f"Не удалось разместить ордер: {error_msg}"
+                )
+                self.logger.error(f"Ошибка размещения ордера на продажу {symbol}: {error_msg}")
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка продажи инструмента {symbol}: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось продать {symbol}: {e}")
     
     def _filter_trades(self):
         """
         Фильтрация сделок по дате
         """
-        # В реальной реализации здесь будет фильтрация по датам
-        date_from = self.date_from_edit.date().toPython()
-        date_to = self.date_to_edit.date().toPython()
-        self.logger.info(f"Применен фильтр сделок: {date_from} - {date_to}")
+        try:
+            date_from = self.date_from_edit.date().toPython()
+            date_to = self.date_to_edit.date().toPython()
+            
+            # Добавляем один день к date_to, чтобы включить весь выбранный день
+            date_to = date_to + timedelta(days=1)
+            
+            # Получаем все сделки
+            all_trades = self.portfolio_data.get("recent_trades", [])
+            
+            # Фильтруем сделки по дате
+            filtered_trades = []
+            for trade in all_trades:
+                trade_date = trade.get("timestamp")
+                if isinstance(trade_date, datetime) and date_from <= trade_date.date() <= date_to.date():
+                    filtered_trades.append(trade)
+            
+            # Временно заменяем список сделок отфильтрованным списком
+            self.filtered_trades = filtered_trades
+            
+            # Обновляем таблицу с отфильтрованными данными
+            self._update_filtered_trades_table()
+            
+            self.logger.info(f"Применен фильтр сделок: {date_from} - {date_to}, найдено {len(filtered_trades)} сделок")
+        except Exception as e:
+            self.logger.error(f"Ошибка при фильтрации сделок: {e}")
+            QMessageBox.warning(self, "Предупреждение", f"Ошибка при фильтрации сделок: {e}")
     
     def _export_portfolio(self):
         """
@@ -990,9 +1455,59 @@ class PortfolioTab(QWidget):
     
     def _export_trades(self):
         """
-        Экспорт истории сделок
+        Экспорт истории сделок в CSV файл
         """
-        QMessageBox.information(self, "Информация", "Функция экспорта сделок будет реализована")
+        try:
+            from PySide6.QtWidgets import QFileDialog
+            import csv
+            
+            # Определяем, какие сделки экспортировать (отфильтрованные или все)
+            if hasattr(self, 'filtered_trades') and self.filtered_trades:
+                trades = self.filtered_trades
+            else:
+                trades = self.portfolio_data.get("recent_trades", [])
+            
+            if not trades:
+                QMessageBox.warning(self, "Предупреждение", "Нет сделок для экспорта")
+                return
+            
+            # Запрашиваем путь для сохранения файла
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Экспорт истории сделок",
+                f"trade_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "CSV Files (*.csv)"
+            )
+            
+            if not file_path:
+                return  # Пользователь отменил сохранение
+            
+            # Экспортируем данные в CSV
+            with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['Дата и время', 'Символ', 'Направление', 'Размер', 'Цена', 'P&L', 'Комиссия', 'ID ордера', 'Статус']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for trade in trades:
+                    timestamp = trade.get("timestamp", datetime.now())
+                    writer.writerow({
+                        'Дата и время': timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                        'Символ': trade.get("symbol", ""),
+                        'Направление': trade.get("side", ""),
+                        'Размер': trade.get("size", 0),
+                        'Цена': f"${trade.get('price', 0):.4f}",
+                        'P&L': f"${trade.get('realized_pnl', 0):.2f}",
+                        'Комиссия': f"${trade.get('fee', 0):.2f}",
+                        'ID ордера': trade.get("order_id", ""),
+                        'Статус': trade.get("status", "")
+                    })
+            
+            self.logger.info(f"Экспортировано {len(trades)} сделок в {file_path}")
+            QMessageBox.information(self, "Информация", f"Экспортировано {len(trades)} сделок в {file_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при экспорте сделок: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось экспортировать сделки: {e}")
     
     def _generate_detailed_report(self):
         """

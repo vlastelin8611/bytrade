@@ -175,7 +175,45 @@ def validate_config():
 def get_api_credentials():
     """
     Получение API учетных данных
+    Сначала пытается загрузить ключи из файла 'keys',
+    если не получается, использует значения из config.py
     """
+    try:
+        from pathlib import Path
+        keys_path = Path(__file__).parent / 'keys'
+        if keys_path.exists():
+            with open(keys_path, 'r') as f:
+                lines = f.readlines()
+                
+            api_key = API_KEY
+            api_secret = API_SECRET
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('#') or not line:
+                    continue
+                    
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    if USE_TESTNET and key == 'BYBIT_TESTNET_API_KEY':
+                        api_key = value
+                    elif USE_TESTNET and key == 'BYBIT_TESTNET_API_SECRET':
+                        api_secret = value
+                    elif not USE_TESTNET and key == 'BYBIT_API_KEY':
+                        api_key = value
+                    elif not USE_TESTNET and key == 'BYBIT_API_SECRET':
+                        api_secret = value
+            
+            print(f"✅ API ключи загружены из файла {keys_path}")
+            return {
+                'api_key': api_key,
+                'api_secret': api_secret,
+                'testnet': USE_TESTNET
+            }
+    except Exception as e:
+        print(f"⚠️ Ошибка загрузки API ключей из файла: {e}")
+        print("⚠️ Используем ключи из config.py")
+    
     return {
         'api_key': API_KEY,
         'api_secret': API_SECRET,
@@ -241,8 +279,8 @@ create_data_directory()
 5. Скопируйте API Key и Secret Key
 
 6. Замените значения в этом файле:
-   API_KEY = "ваш_api_ключ"
-   API_SECRET = "ваш_api_секрет"
+   API_KEY = "9HlqDp2h1HwSP8Ydnk"
+   API_SECRET = "hXpgFc1Wd97IzRuqBV96wCcScH2s7LDLSKij"
 
 7. Для начала установите USE_TESTNET = True для безопасного тестирования
 

@@ -54,6 +54,9 @@ class BaseStrategy(ABC):
         self.start_time = None
         self.last_update = None
         
+        # Информация о текущем ордере
+        self.current_order_id = None
+        
         # Настройки из конфигурации
         self.symbol = config.get('asset', 'BTCUSDT')
         self.position_size = config.get('position_size', 0.01)
@@ -122,6 +125,76 @@ class BaseStrategy(ABC):
             Кортеж (тип сигнала, уверенность 0-1)
         """
         pass
+        
+    def execute_external_signal(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Выполнение внешнего торгового сигнала (из индикаторов, ML-моделей и т.д.)
+        
+        Args:
+            signal_data: Данные сигнала с ключами:
+                - signal: Тип сигнала (BUY, SELL, CLOSE_LONG, CLOSE_SHORT)
+                - price: Текущая цена
+                - confidence: Уверенность в сигнале (0-1)
+                - metadata: Дополнительные данные сигнала (опционально)
+            
+        Returns:
+            Результат выполнения сигнала
+        """
+        try:
+            # Проверка обязательных полей
+            required_fields = ['signal', 'price']
+            for field in required_fields:
+                if field not in signal_data:
+                    error_msg = f"Отсутствует обязательное поле: {field}"
+                    self.logger.error(error_msg)
+                    return {'status': 'error', 'message': error_msg}
+            
+            # Извлечение данных сигнала
+            signal_type = signal_data['signal']
+            price = float(signal_data['price'])
+            confidence = float(signal_data.get('confidence', 0.8))
+            metadata = signal_data.get('metadata', {})
+            
+            # Логирование получения внешнего сигнала
+            self._log_strategy_event(
+                "EXTERNAL_SIGNAL_RECEIVED",
+                f"Получен внешний сигнал {signal_type} по цене {price} с уверенностью {confidence:.2f}",
+                f"External signal received: {signal_type}, price: {price}, confidence: {confidence}",
+                {
+                    'signal': signal_type,
+                    'price': price,
+                    'confidence': confidence,
+                    'source': metadata.get('source', 'unknown'),
+                    'timestamp': metadata.get('timestamp', datetime.utcnow().isoformat())
+                }
+            )
+            
+            # Выполнение сигнала через основной метод
+            result = self.execute_signal(signal_type, price, confidence)
+            
+            # Добавление метаданных к результату
+            if 'metadata' in signal_data:
+                result['metadata'] = signal_data['metadata']
+                
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка выполнения внешнего сигнала: {e}")
+            self._log_strategy_event(
+                "EXTERNAL_SIGNAL_ERROR",
+                f"Ошибка выполнения внешнего сигнала: {str(e)}",
+                f"Error executing external signal: {type(e).__name__}: {str(e)}",
+                {
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'signal_data': signal_data
+                }
+            )
+            return {
+                'status': 'error',
+                'message': str(e),
+                'signal_data': signal_data
+            }
     
     @abstractmethod
     def get_strategy_description(self) -> str:
@@ -350,8 +423,9 @@ class BaseStrategy(ABC):
                 self.pause()
                 return {'status': 'risk_limit_exceeded'}
             
-            # Обработка сигнала
-            result = self._process_signal(signal, confidence, market_data)
+            # Выполнение сигнала через новый метод execute_signal
+            current_price = market_data.get('price', 0)
+            result = self.execute_signal(signal.value, current_price, confidence)
             
             # Обновление позиции
             self._update_position_status()
@@ -361,7 +435,8 @@ class BaseStrategy(ABC):
                 'signal': signal.value,
                 'confidence': confidence,
                 'analysis': analysis,
-                'action': result
+                'action': result.get('result', {}),
+                'order_id': self.current_order_id
             }
             
         except Exception as e:
@@ -411,6 +486,57 @@ class BaseStrategy(ABC):
             'config': self.config,
             'risk_assessment': risk_assessment
         }
+    
+    def get_detailed_status(self) -> Dict[str, Any]:
+        """
+        Получение детального статуса стратегии, включая информацию о текущем ордере и позиции
+        
+        Returns:
+            Словарь с детальным статусом стратегии
+        """
+        # Базовое состояние стратегии
+        status = self.get_status()
+        
+        # Добавление информации о текущем ордере, если есть
+        if self.current_order_id:
+            try:
+                order_info = self.api_client.get_order_info(
+                    category='linear',
+                    symbol=self.symbol,
+                    orderId=self.current_order_id
+                )
+                status['current_order'] = order_info
+            except Exception as e:
+                self.logger.error(f"Ошибка получения информации о текущем ордере: {e}")
+                status['current_order'] = {'error': str(e)}
+        else:
+            status['current_order'] = None
+            
+        # Добавление информации о текущей позиции
+        try:
+            position_info = self.api_client.get_position_info(
+                category='linear',
+                symbol=self.symbol
+            )
+            status['position_details'] = position_info
+        except Exception as e:
+            self.logger.error(f"Ошибка получения информации о текущей позиции: {e}")
+            status['position_details'] = {'error': str(e)}
+            
+        # Добавление информации о текущей позиции в стратегии
+        if self.current_position:
+            status['position_info'] = {
+                'type': self.current_position,
+                'entry_price': self.entry_price,
+                'stop_loss': self.stop_loss_price,
+                'take_profit': self.take_profit_price,
+                'position_size': self.position_size
+            }
+        
+        # Добавление информации о риск-менеджере
+        status['risk_details'] = self.risk_manager.get_detailed_assessment()
+        
+        return status
     
     def _validate_config(self) -> bool:
         """
@@ -492,6 +618,101 @@ class BaseStrategy(ABC):
         
         return True
     
+    def execute_signal(self, signal_type: str, price: float, confidence: float = 0.8) -> Dict[str, Any]:
+        """
+        Выполнение торгового сигнала через API
+        
+        Args:
+            signal_type: Тип сигнала (BUY, SELL, CLOSE_LONG, CLOSE_SHORT)
+            price: Текущая цена
+            confidence: Уверенность в сигнале (0-1)
+            
+        Returns:
+            Результат выполнения сигнала
+        """
+        try:
+            # Преобразование строкового сигнала в SignalType
+            signal_map = {
+                'BUY': SignalType.BUY,
+                'SELL': SignalType.SELL,
+                'CLOSE_LONG': SignalType.CLOSE_LONG,
+                'CLOSE_SHORT': SignalType.CLOSE_SHORT,
+                'HOLD': SignalType.HOLD
+            }
+            
+            signal = signal_map.get(signal_type.upper())
+            if not signal:
+                self.logger.error(f"Неизвестный тип сигнала: {signal_type}")
+                return {'status': 'error', 'message': f'Неизвестный тип сигнала: {signal_type}'}
+            
+            # Создаем минимальные рыночные данные
+            market_data = {'price': price}
+            
+            # Проверка риск-лимитов с учетом уверенности сигнала
+            if not self._check_risk_limits(confidence):
+                self.logger.warning("Превышены риск-лимиты, сигнал отклонен")
+                self._log_strategy_event(
+                    "SIGNAL_REJECTED",
+                    f"Сигнал {signal_type} отклонен из-за превышения риск-лимитов",
+                    f"Signal rejected due to risk limits: {signal_type}, confidence: {confidence}",
+                    {
+                        'signal': signal_type,
+                        'confidence': confidence,
+                        'price': price,
+                        'daily_pnl': self.daily_pnl,
+                        'consecutive_losses': self.consecutive_losses
+                    }
+                )
+                return {
+                    'status': 'rejected',
+                    'reason': 'risk_limit_exceeded',
+                    'signal': signal_type
+                }
+            
+            # Обрабатываем сигнал через существующий метод
+            result = self._process_signal(signal, confidence, market_data)
+            
+            # Логирование выполнения сигнала
+            self._log_strategy_event(
+                "SIGNAL_EXECUTED",
+                f"Выполнен сигнал {signal_type} по цене {price} с уверенностью {confidence:.2f}",
+                f"Signal executed: {signal_type}, price: {price}, confidence: {confidence}",
+                {
+                    'signal': signal_type,
+                    'confidence': confidence,
+                    'price': price,
+                    'action': result.get('action', 'unknown'),
+                    'order_id': self.current_order_id
+                }
+            )
+            
+            return {
+                'status': 'success',
+                'signal': signal_type,
+                'confidence': confidence,
+                'price': price,
+                'result': result,
+                'order_id': self.current_order_id
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка выполнения сигнала {signal_type}: {e}")
+            self._log_strategy_event(
+                "SIGNAL_ERROR",
+                f"Ошибка выполнения сигнала {signal_type}: {str(e)}",
+                f"Error executing signal: {type(e).__name__}: {str(e)}",
+                {
+                    'signal': signal_type,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            return {
+                'status': 'error',
+                'message': str(e),
+                'signal': signal_type
+            }
+    
     def _process_signal(self, signal: SignalType, confidence: float, 
                       market_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -543,8 +764,20 @@ class BaseStrategy(ABC):
             stop_loss = price * (1 - self.stop_loss_pct / 100)
             take_profit = price * (1 + self.take_profit_pct / 100)
             
-            # Здесь должен быть реальный вызов API для открытия позиции
-            # order_result = self.api_client.place_order(...)
+            # Вызов API для открытия длинной позиции
+            order_result = self.api_client.place_order(
+                category='linear',
+                symbol=self.symbol,
+                side='Buy',
+                orderType='Market',
+                qty=str(self.position_size)
+            )
+            
+            # Логирование результата ордера
+            self.logger.info(f"Размещен ордер на покупку: {order_result}")
+            
+            # Сохранение ID ордера
+            self.current_order_id = order_result.get('orderId') if order_result else None
             
             self.current_position = 'long'
             self.entry_price = price
@@ -590,6 +823,21 @@ class BaseStrategy(ABC):
             # Расчет стоп-лосса и тейк-профита
             stop_loss = price * (1 + self.stop_loss_pct / 100)
             take_profit = price * (1 - self.take_profit_pct / 100)
+            
+            # Вызов API для открытия короткой позиции
+            order_result = self.api_client.place_order(
+                category='linear',
+                symbol=self.symbol,
+                side='Sell',
+                orderType='Market',
+                qty=str(self.position_size)
+            )
+            
+            # Логирование результата ордера
+            self.logger.info(f"Размещен ордер на продажу: {order_result}")
+            
+            # Сохранение ID ордера
+            self.current_order_id = order_result.get('orderId') if order_result else None
             
             self.current_position = 'short'
             self.entry_price = price
@@ -672,8 +920,21 @@ class BaseStrategy(ABC):
                 self.daily_pnl += pnl_pct
                 self.total_pnl += pnl_pct
             
-            # Здесь должен быть реальный вызов API для закрытия позиции
-            # close_result = self.api_client.close_position(...)
+            # Вызов API для закрытия позиции
+            side = 'Sell' if self.current_position == 'long' else 'Buy'
+            close_result = self.api_client.place_order(
+                category='linear',
+                symbol=self.symbol,
+                side=side,
+                orderType='Market',
+                qty=str(self.position_size)
+            )
+            
+            # Логирование результата закрытия
+            self.logger.info(f"Закрыта позиция: {close_result}")
+            
+            # Сброс ID ордера
+            self.current_order_id = None
             
             position_type = self.current_position
             self.current_position = None
@@ -719,35 +980,779 @@ class BaseStrategy(ABC):
         if not self.current_position:
             return
         
-        # Здесь должна быть логика проверки статуса позиции через API
-        # и обновления PnL, проверки стоп-лосса/тейк-профита
-        pass
+        try:
+            # Получение текущей цены через API
+            ticker_info = self.api_client.get_tickers(category='linear', symbol=self.symbol)
+            
+            if not ticker_info or 'result' not in ticker_info:
+                self.logger.warning(f"Не удалось получить данные тикера для {self.symbol}")
+                return
+            
+            # Извлечение текущей цены
+            current_price = None
+            if 'list' in ticker_info['result'] and ticker_info['result']['list']:
+                ticker_data = ticker_info['result']['list'][0]
+                if self.current_position == 'long':
+                    current_price = float(ticker_data.get('lastPrice', 0))
+                else:  # short
+                    current_price = float(ticker_data.get('lastPrice', 0))
+            
+            if not current_price:
+                self.logger.warning(f"Не удалось извлечь текущую цену для {self.symbol}")
+                return
+            
+            # Расчет текущего PnL
+            pnl_pct = 0.0
+            if self.entry_price:
+                if self.current_position == 'long':
+                    pnl_pct = ((current_price - self.entry_price) / self.entry_price) * 100
+                elif self.current_position == 'short':
+                    pnl_pct = ((self.entry_price - current_price) / self.entry_price) * 100
+            
+            # Проверка стоп-лосса и тейк-профита
+            if self.current_position == 'long':
+                if current_price <= self.stop_loss_price:
+                    self.logger.info(f"Сработал стоп-лосс для длинной позиции: {current_price} <= {self.stop_loss_price}")
+                    self._close_position("Stop Loss triggered", current_price)
+                elif current_price >= self.take_profit_price:
+                    self.logger.info(f"Сработал тейк-профит для длинной позиции: {current_price} >= {self.take_profit_price}")
+                    self._close_position("Take Profit triggered", current_price)
+            elif self.current_position == 'short':
+                if current_price >= self.stop_loss_price:
+                    self.logger.info(f"Сработал стоп-лосс для короткой позиции: {current_price} >= {self.stop_loss_price}")
+                    self._close_position("Stop Loss triggered", current_price)
+                elif current_price <= self.take_profit_price:
+                    self.logger.info(f"Сработал тейк-профит для короткой позиции: {current_price} <= {self.take_profit_price}")
+                    self._close_position("Take Profit triggered", current_price)
+            
+            # Обновление текущего PnL в логах
+            self.logger.debug(f"Текущий PnL для {self.symbol}: {pnl_pct:.2f}%")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при обновлении статуса позиции: {e}")
+            return
     
-    def _log_strategy_event(self, action: str, human_description: str, 
-                          technical_details: str = None, data: Dict = None):
+    def cancel_current_order(self) -> Dict[str, Any]:
         """
-        Логирование события стратегии в базу данных
+        Отмена текущего ордера, если он существует
+        
+        Returns:
+            Результат отмены ордера
+        """
+        if not self.current_order_id:
+            return {
+                'status': 'warning',
+                'message': 'Нет активного ордера для отмены'
+            }
+            
+        try:
+            # Получение информации о текущем ордере перед отменой
+            try:
+                order_info = self.api_client.get_order_info(
+                    category='linear',
+                    symbol=self.symbol,
+                    orderId=self.current_order_id
+                )
+            except Exception as e:
+                self.logger.warning(f"Не удалось получить информацию о ордере перед отменой: {e}")
+                order_info = {'orderId': self.current_order_id}
+                
+            # Отмена ордера
+            cancel_result = self.api_client.cancel_order(
+                category='linear',
+                symbol=self.symbol,
+                orderId=self.current_order_id
+            )
+            
+            # Логирование события отмены ордера
+            self._log_strategy_event(
+                "ORDER_CANCELLED",
+                f"Ордер {self.current_order_id} отменен",
+                f"Order {self.current_order_id} cancelled",
+                {
+                    'order_id': self.current_order_id,
+                    'symbol': self.symbol,
+                    'order_info': order_info,
+                    'cancel_result': cancel_result
+                }
+            )
+            
+            # Сброс ID текущего ордера
+            self.current_order_id = None
+            
+            return {
+                'status': 'success',
+                'message': f"Ордер {self.current_order_id} успешно отменен",
+                'order_info': order_info,
+                'cancel_result': cancel_result
+            }
+            
+        except Exception as e:
+            error_msg = f"Ошибка при отмене ордера {self.current_order_id}: {e}"
+            self.logger.error(error_msg)
+            
+            # Логирование ошибки
+            self._log_strategy_event(
+                "ORDER_CANCEL_ERROR",
+                error_msg,
+                f"Error cancelling order {self.current_order_id}: {type(e).__name__}: {str(e)}",
+                {
+                    'order_id': self.current_order_id,
+                    'symbol': self.symbol,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_msg,
+                'order_id': self.current_order_id,
+                'error': str(e)
+            }
+            
+    def update_stop_loss_take_profit(self, stop_loss: Optional[float] = None, take_profit: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Обновление стоп-лосса и тейк-профита для текущей позиции
         
         Args:
-            action: Тип действия
-            human_description: Человекочитаемое описание
-            technical_details: Технические детали
-            data: Дополнительные данные
+            stop_loss: Новая цена стоп-лосса
+            take_profit: Новая цена тейк-профита
+            
+        Returns:
+            Результат обновления
+        """
+        if not self.current_position:
+            return {
+                'status': 'error',
+                'message': 'Нет активной позиции для обновления стоп-лосса и тейк-профита'
+            }
+            
+        if stop_loss is None and take_profit is None:
+            return {
+                'status': 'error',
+                'message': 'Необходимо указать хотя бы один параметр: stop_loss или take_profit'
+            }
+            
+        try:
+            # Получение информации о текущей позиции
+            position_info = self.api_client.get_position_info(
+                category='linear',
+                symbol=self.symbol
+            )
+            
+            # Проверка наличия позиции
+            if not position_info or 'size' not in position_info or float(position_info['size']) == 0:
+                return {
+                    'status': 'error',
+                    'message': 'Нет активной позиции на бирже'
+                }
+                
+            # Определение параметров для обновления
+            update_params = {
+                'category': 'linear',
+                'symbol': self.symbol,
+                'positionIdx': 0  # 0 для одностороннего режима
+            }
+            
+            # Добавление стоп-лосса, если указан
+            if stop_loss is not None:
+                update_params['stopLoss'] = str(stop_loss)
+                self.stop_loss_price = stop_loss
+                
+            # Добавление тейк-профита, если указан
+            if take_profit is not None:
+                update_params['takeProfit'] = str(take_profit)
+                self.take_profit_price = take_profit
+                
+            # Обновление позиции через API
+            result = self.api_client.set_trading_stop(**update_params)
+            
+            # Логирование события обновления
+            self._log_strategy_event(
+                "POSITION_SL_TP_UPDATED",
+                f"Обновлены SL/TP для позиции {self.symbol}: SL={stop_loss}, TP={take_profit}",
+                f"Updated SL/TP for position {self.symbol}: SL={stop_loss}, TP={take_profit}",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'old_stop_loss': self.stop_loss_price if stop_loss is None else None,
+                    'new_stop_loss': stop_loss,
+                    'old_take_profit': self.take_profit_price if take_profit is None else None,
+                    'new_take_profit': take_profit,
+                    'api_result': result
+                }
+            )
+            
+            return {
+                'status': 'success',
+                'message': 'Стоп-лосс и тейк-профит успешно обновлены',
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'api_result': result
+            }
+            
+        except Exception as e:
+            error_msg = f"Ошибка при обновлении стоп-лосса и тейк-профита: {e}"
+            self.logger.error(error_msg)
+            
+            # Логирование ошибки
+            self._log_strategy_event(
+                "POSITION_SL_TP_UPDATE_ERROR",
+                error_msg,
+                f"Error updating SL/TP for position {self.symbol}: {type(e).__name__}: {str(e)}",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'requested_stop_loss': stop_loss,
+                    'requested_take_profit': take_profit,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_msg,
+                'error': str(e)
+            }
+            
+    def partial_close_position(self, close_percent: float) -> Dict[str, Any]:
+        """
+        Частичное закрытие текущей позиции
+        
+        Args:
+            close_percent: Процент позиции для закрытия (0-100)
+            
+        Returns:
+            Результат закрытия части позиции
+        """
+        if not self.current_position:
+            return {
+                'status': 'error',
+                'message': 'Нет активной позиции для частичного закрытия'
+            }
+            
+        if close_percent <= 0 or close_percent > 100:
+            return {
+                'status': 'error',
+                'message': 'Процент закрытия должен быть в диапазоне от 0 до 100'
+            }
+            
+        try:
+            # Получение информации о текущей позиции
+            position_info = self.api_client.get_position_info(
+                category='linear',
+                symbol=self.symbol
+            )
+            
+            # Проверка наличия позиции
+            if not position_info or 'size' not in position_info or float(position_info['size']) == 0:
+                return {
+                    'status': 'error',
+                    'message': 'Нет активной позиции на бирже'
+                }
+                
+            # Расчет размера для закрытия
+            current_size = float(position_info['size'])
+            close_size = current_size * (close_percent / 100.0)
+            
+            # Определение направления закрытия
+            side = 'Sell' if self.current_position == 'long' else 'Buy'
+            
+            # Создание ордера на закрытие части позиции
+            order_params = {
+                'category': 'linear',
+                'symbol': self.symbol,
+                'side': side,
+                'orderType': 'Market',
+                'qty': str(close_size),
+                'reduceOnly': True
+            }
+            
+            # Размещение ордера через API
+            order_result = self.api_client.place_order(**order_params)
+            
+            # Получение ID ордера
+            order_id = None
+            if order_result and 'result' in order_result and 'orderId' in order_result['result']:
+                order_id = order_result['result']['orderId']
+            
+            # Обновление размера позиции в стратегии
+            remaining_size = current_size - close_size
+            if remaining_size > 0:
+                self.position_size = remaining_size
+            else:
+                # Если закрыли всю позицию, сбрасываем статус
+                self._update_position_status(None)
+            
+            # Логирование события частичного закрытия
+            self._log_strategy_event(
+                "POSITION_PARTIAL_CLOSE",
+                f"Частично закрыта позиция {self.symbol}: {close_percent}% ({close_size} из {current_size})",
+                f"Partially closed position {self.symbol}: {close_percent}% ({close_size} of {current_size})",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'close_percent': close_percent,
+                    'close_size': close_size,
+                    'original_size': current_size,
+                    'remaining_size': remaining_size,
+                    'order_id': order_id,
+                    'order_result': order_result
+                }
+            )
+            
+            return {
+                'status': 'success',
+                'message': f"Успешно закрыто {close_percent}% позиции",
+                'close_percent': close_percent,
+                'close_size': close_size,
+                'original_size': current_size,
+                'remaining_size': remaining_size,
+                'order_id': order_id,
+                'order_result': order_result
+            }
+            
+        except Exception as e:
+            error_msg = f"Ошибка при частичном закрытии позиции: {e}"
+            self.logger.error(error_msg)
+            
+            # Логирование ошибки
+            self._log_strategy_event(
+                "POSITION_PARTIAL_CLOSE_ERROR",
+                error_msg,
+                f"Error partially closing position {self.symbol}: {type(e).__name__}: {str(e)}",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'close_percent': close_percent,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_msg,
+                'error': str(e)
+            }
+            
+    def modify_position_size(self, new_size: float, is_increase: bool = True) -> Dict[str, Any]:
+        """
+        Изменение размера текущей позиции (увеличение или уменьшение)
+        
+        Args:
+            new_size: Размер для добавления или уменьшения позиции
+            is_increase: True для увеличения позиции, False для уменьшения
+            
+        Returns:
+            Результат изменения размера позиции
+        """
+        if not self.current_position:
+            return {
+                'status': 'error',
+                'message': 'Нет активной позиции для изменения размера'
+            }
+            
+        if new_size <= 0:
+            return {
+                'status': 'error',
+                'message': 'Размер изменения должен быть положительным числом'
+            }
+            
+        try:
+            # Получение информации о текущей позиции
+            position_info = self.api_client.get_position_info(
+                category='linear',
+                symbol=self.symbol
+            )
+            
+            # Проверка наличия позиции
+            if not position_info or 'size' not in position_info or float(position_info['size']) == 0:
+                return {
+                    'status': 'error',
+                    'message': 'Нет активной позиции на бирже'
+                }
+                
+            current_size = float(position_info['size'])
+            
+            # Определение направления ордера
+            if is_increase:
+                # Для увеличения позиции используем то же направление, что и у текущей позиции
+                side = 'Buy' if self.current_position == 'long' else 'Sell'
+                action_type = 'увеличения'
+                action_type_en = 'increase'
+                reduce_only = False
+            else:
+                # Для уменьшения позиции используем противоположное направление
+                side = 'Sell' if self.current_position == 'long' else 'Buy'
+                action_type = 'уменьшения'
+                action_type_en = 'decrease'
+                reduce_only = True
+                
+                # Проверка, что размер уменьшения не превышает текущий размер позиции
+                if new_size >= current_size:
+                    return {
+                        'status': 'error',
+                        'message': f'Размер уменьшения ({new_size}) не может быть больше или равен текущему размеру позиции ({current_size})'
+                    }
+            
+            # Создание ордера на изменение размера позиции
+            order_params = {
+                'category': 'linear',
+                'symbol': self.symbol,
+                'side': side,
+                'orderType': 'Market',
+                'qty': str(new_size),
+                'reduceOnly': reduce_only
+            }
+            
+            # Размещение ордера через API
+            order_result = self.api_client.place_order(**order_params)
+            
+            # Получение ID ордера
+            order_id = None
+            if order_result and 'result' in order_result and 'orderId' in order_result['result']:
+                order_id = order_result['result']['orderId']
+            
+            # Обновление размера позиции в стратегии
+            if is_increase:
+                self.position_size = current_size + new_size
+            else:
+                remaining_size = current_size - new_size
+                if remaining_size > 0:
+                    self.position_size = remaining_size
+                else:
+                    # Если закрыли всю позицию, сбрасываем статус
+                    self._update_position_status(None)
+            
+            # Логирование события изменения размера позиции
+            self._log_strategy_event(
+                f"POSITION_SIZE_{action_type_en.upper()}",
+                f"Изменен размер позиции {self.symbol} ({action_type}): {new_size} (было: {current_size}, стало: {self.position_size})",
+                f"Modified position size {self.symbol} ({action_type_en}): {new_size} (was: {current_size}, now: {self.position_size})",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'is_increase': is_increase,
+                    'size_change': new_size,
+                    'original_size': current_size,
+                    'new_size': self.position_size,
+                    'order_id': order_id,
+                    'order_result': order_result
+                }
+            )
+            
+            return {
+                'status': 'success',
+                'message': f"Успешно изменен размер позиции ({action_type})",
+                'is_increase': is_increase,
+                'size_change': new_size,
+                'original_size': current_size,
+                'new_size': self.position_size,
+                'order_id': order_id,
+                'order_result': order_result
+            }
+            
+        except Exception as e:
+            error_msg = f"Ошибка при изменении размера позиции: {e}"
+            self.logger.error(error_msg)
+            
+            # Логирование ошибки
+            self._log_strategy_event(
+                "POSITION_SIZE_MODIFY_ERROR",
+                error_msg,
+                f"Error modifying position size {self.symbol}: {type(e).__name__}: {str(e)}",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'is_increase': is_increase,
+                    'requested_size': new_size,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_msg,
+                'error': str(e)
+            }
+            
+    def get_historical_data(self, interval: str = '1h', limit: int = 100) -> Dict[str, Any]:
+        """
+        Получение исторических данных для анализа
+        
+        Args:
+            interval: Интервал свечей (1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w, 1M)
+            limit: Количество свечей для получения (максимум 1000)
+            
+        Returns:
+            Исторические данные в формате словаря
         """
         try:
-            self.db.log_strategy_action({
-                'strategy_name': self.name,
+            # Проверка валидности интервала
+            valid_intervals = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w', '1M']
+            if interval not in valid_intervals:
+                return {
+                    'status': 'error',
+                    'message': f'Неверный интервал. Допустимые значения: {valid_intervals}'
+                }
+                
+            # Проверка лимита
+            if limit <= 0 or limit > 1000:
+                return {
+                    'status': 'error',
+                    'message': 'Количество свечей должно быть от 1 до 1000'
+                }
+                
+            # Получение исторических данных через API
+            kline_params = {
+                'category': 'linear',
                 'symbol': self.symbol,
-                'action': action,
-                'technical_details': technical_details or f"Action: {action}",
-                'human_readable': human_description,
-                'data': data or {},
-                'session_id': self.session_id
-            })
+                'interval': interval,
+                'limit': limit
+            }
+            
+            kline_result = self.api_client.get_kline(**kline_params)
+            
+            # Проверка результата
+            if not kline_result or 'result' not in kline_result or 'list' not in kline_result['result']:
+                return {
+                    'status': 'error',
+                    'message': 'Не удалось получить исторические данные',
+                    'raw_result': kline_result
+                }
+                
+            # Преобразование данных в удобный формат
+            candles = kline_result['result']['list']
+            formatted_candles = []
+            
+            for candle in candles:
+                # Bybit возвращает данные в формате [timestamp, open, high, low, close, volume, ...]
+                formatted_candles.append({
+                    'timestamp': int(candle[0]),
+                    'open': float(candle[1]),
+                    'high': float(candle[2]),
+                    'low': float(candle[3]),
+                    'close': float(candle[4]),
+                    'volume': float(candle[5])
+                })
+                
+            # Логирование получения исторических данных
+            self._log_strategy_event(
+                "HISTORICAL_DATA_FETCHED",
+                f"Получены исторические данные {self.symbol}, интервал: {interval}, количество: {len(formatted_candles)}",
+                f"Fetched historical data for {self.symbol}, interval: {interval}, count: {len(formatted_candles)}",
+                {
+                    'symbol': self.symbol,
+                    'interval': interval,
+                    'count': len(formatted_candles)
+                }
+            )
+                
+            return {
+                'status': 'success',
+                'interval': interval,
+                'symbol': self.symbol,
+                'candles': formatted_candles,
+                'count': len(formatted_candles)
+            }
+            
         except Exception as e:
-            self.logger.error(f"Ошибка логирования события: {e}")
-    
+            error_msg = f"Ошибка при получении исторических данных: {e}"
+            self.logger.error(error_msg)
+            
+            # Логирование ошибки
+            self._log_strategy_event(
+                "HISTORICAL_DATA_ERROR",
+                error_msg,
+                f"Error fetching historical data for {self.symbol}: {type(e).__name__}: {str(e)}",
+                {
+                    'symbol': self.symbol,
+                    'interval': interval,
+                    'limit': limit,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_msg,
+                'error': str(e)
+            }
+            
     def get_risk_status(self) -> Dict[str, Any]:
+        """
+        Получение текущего статуса рисков стратегии
+        
+        Returns:
+            Информация о текущих рисках стратегии
+        """
+        # Здесь должна быть реализация оценки рисков стратегии
+        # Например, анализ текущей позиции, убытков, волатильности и т.д.
+        
+        return {
+            'status': 'success',
+            'risk_level': 'low',  # low, medium, high
+            'max_drawdown': 0.0,  # максимальная просадка в %
+            'current_drawdown': 0.0,  # текущая просадка в %
+            'position_risk': 'low'  # оценка риска текущей позиции
+        }
+        
+    def force_close_position(self) -> Dict[str, Any]:
+        """
+        Принудительное закрытие текущей позиции
+        
+        Returns:
+            Результат закрытия позиции
+        """
+        if not self.current_position:
+            return {
+                'status': 'error',
+                'message': 'Нет активной позиции для закрытия'
+            }
+            
+        try:
+            # Получение информации о текущей позиции
+            position_info = self.api_client.get_position_info(
+                category='linear',
+                symbol=self.symbol
+            )
+            
+            # Проверка наличия позиции
+            if not position_info or 'size' not in position_info or float(position_info['size']) == 0:
+                return {
+                    'status': 'error',
+                    'message': 'Нет активной позиции на бирже'
+                }
+                
+            current_size = float(position_info['size'])
+            
+            # Определение направления ордера для закрытия позиции
+            side = 'Sell' if self.current_position == 'long' else 'Buy'
+            
+            # Создание ордера на закрытие позиции
+            order_params = {
+                'category': 'linear',
+                'symbol': self.symbol,
+                'side': side,
+                'orderType': 'Market',
+                'qty': str(current_size),
+                'reduceOnly': True
+            }
+            
+            # Размещение ордера через API
+            order_result = self.api_client.place_order(**order_params)
+            
+            # Получение ID ордера
+            order_id = None
+            if order_result and 'result' in order_result and 'orderId' in order_result['result']:
+                order_id = order_result['result']['orderId']
+            
+            # Сброс статуса позиции
+            self._update_position_status(None)
+            
+            # Логирование события закрытия позиции
+            self._log_strategy_event(
+                "POSITION_FORCE_CLOSED",
+                f"Принудительно закрыта позиция {self.symbol} размером {current_size}",
+                f"Force closed position {self.symbol} with size {current_size}",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'size': current_size,
+                    'order_id': order_id,
+                    'order_result': order_result
+                }
+            )
+            
+            return {
+                'status': 'success',
+                'message': 'Позиция успешно закрыта',
+                'size': current_size,
+                'order_id': order_id,
+                'order_result': order_result
+            }
+            
+        except Exception as e:
+            error_msg = f"Ошибка при закрытии позиции: {e}"
+            self.logger.error(error_msg)
+            
+            # Логирование ошибки
+            self._log_strategy_event(
+                "POSITION_FORCE_CLOSE_ERROR",
+                error_msg,
+                f"Error force closing position {self.symbol}: {type(e).__name__}: {str(e)}",
+                {
+                    'symbol': self.symbol,
+                    'position_type': self.current_position,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_msg,
+                'error': str(e)
+            }
+            
+    def reset_risk_limits(self) -> Dict[str, Any]:
+        """
+        Сброс лимитов риска для стратегии
+        
+        Returns:
+            Словарь с результатом операции
+        """
+        try:
+            # Сброс лимитов риска в риск-менеджере
+            self.risk_manager.reset_limits()
+            
+            # Логирование события сброса лимитов
+            self._log_strategy_event(
+                "RISK_LIMITS_RESET",
+                f"Сброшены лимиты риска для стратегии {self.strategy_name}",
+                f"Risk limits reset for strategy {self.strategy_name}",
+                {
+                    'strategy_name': self.strategy_name,
+                    'symbol': self.symbol
+                }
+            )
+            
+            return {
+                'status': 'success',
+                'message': 'Лимиты риска успешно сброшены',
+                'strategy_name': self.strategy_name,
+                'symbol': self.symbol
+            }
+            
+        except Exception as e:
+            error_msg = f"Ошибка при сбросе лимитов риска: {e}"
+            self.logger.error(error_msg)
+            
+            # Логирование ошибки
+            self._log_strategy_event(
+                "RISK_LIMITS_RESET_ERROR",
+                error_msg,
+                f"Error resetting risk limits for {self.strategy_name}: {type(e).__name__}: {str(e)}",
+                {
+                    'strategy_name': self.strategy_name,
+                    'symbol': self.symbol,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            return {
+                'status': 'error',
+                'message': error_msg,
+                'error': str(e)
+            }
+    
+    def get_risk_assessment(self) -> Dict[str, Any]:
         """
         Получение детальной информации о рисках
         
@@ -755,42 +1760,6 @@ class BaseStrategy(ABC):
             Словарь с информацией о рисках
         """
         return self.risk_manager.get_risk_assessment()
-    
-    def force_close_position(self, reason: str = "Force close") -> Dict[str, Any]:
-        """
-        Принудительное закрытие позиции
-        
-        Args:
-            reason: Причина принудительного закрытия
-            
-        Returns:
-            Результат операции
-        """
-        if not self.current_position:
-            return {'action': 'no_position'}
-        
-        self.logger.warning(f"Принудительное закрытие позиции: {reason}")
-        return self._close_position(reason)
-    
-    def reset_risk_limits(self) -> bool:
-        """
-        Сброс риск-лимитов (например, после анализа ситуации)
-        
-        Returns:
-            True если сброс успешен
-        """
-        try:
-            self.risk_manager.reset_daily_stats()
-            self.consecutive_losses = 0
-            self.daily_pnl = 0.0
-            
-            self.logger.info("Риск-лимиты сброшены")
-            self._log_strategy_event("RESET_RISKS", "Риск-лимиты сброшены")
-            
-            return True
-        except Exception as e:
-            self.logger.error(f"Ошибка сброса риск-лимитов: {e}")
-            return False
     
     def update_risk_config(self, new_config: Dict[str, Any]) -> bool:
         """
