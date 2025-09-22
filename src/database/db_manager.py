@@ -1,734 +1,584 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Менеджер базы данных для Bybit Trading Bot
-
-Обеспечивает работу с SQLite базой данных для хранения:
-- Логов всех операций
-- Торговых данных
-- Исторических данных
-- Настроек стратегий
-- Результатов анализа
+Менеджер базы данных для детального логирования торговых операций
+Ведет подробные логи всех действий программы для анализа и обучения
 """
 
-import logging
 import sqlite3
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Union
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, JSON, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.exc import SQLAlchemyError
 import json
-
-Base = declarative_base()
-
-class LogEntry(Base):
-    """
-    Модель для хранения логов приложения
-    """
-    __tablename__ = 'log_entries'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    level = Column(String(10), nullable=False)  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-    logger_name = Column(String(50), nullable=False)
-    module = Column(String(50))
-    function = Column(String(50))
-    line_number = Column(Integer)
-    message = Column(Text, nullable=False)
-    exception = Column(Text)
-    session_id = Column(String(36))  # UUID сессии
-
-class TradeEntry(Base):
-    """
-    Модель для хранения торговых операций
-    """
-    __tablename__ = 'trade_entries'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    order_id = Column(String(50), unique=True)
-    symbol = Column(String(20), nullable=False)
-    side = Column(String(10), nullable=False)  # Buy/Sell
-    order_type = Column(String(20), nullable=False)  # Market/Limit
-    quantity = Column(Float, nullable=False)
-    price = Column(Float)
-    executed_price = Column(Float)
-    executed_quantity = Column(Float)
-    status = Column(String(20), nullable=False)  # New/PartiallyFilled/Filled/Cancelled
-    strategy_name = Column(String(50))
-    profit_loss = Column(Float)
-    commission = Column(Float)
-    environment = Column(String(10), default='testnet')  # testnet/mainnet
-    additional_data = Column(JSON)
-
-class StrategyLog(Base):
-    """
-    Модель для хранения логов стратегий
-    """
-    __tablename__ = 'strategy_logs'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    strategy_name = Column(String(50), nullable=False)
-    symbol = Column(String(20))
-    action = Column(String(50), nullable=False)
-    technical_details = Column(Text)  # Технические детали для анализа
-    human_readable = Column(Text)  # Человекочитаемое описание на русском
-    data = Column(JSON)  # Дополнительные данные
-    session_id = Column(String(36))
-
-class MarketData(Base):
-    """
-    Модель для хранения рыночных данных
-    """
-    __tablename__ = 'market_data'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    symbol = Column(String(20), nullable=False)
-    timeframe = Column(String(10), nullable=False)  # 1m, 5m, 1h, 1d
-    open_price = Column(Float, nullable=False)
-    high_price = Column(Float, nullable=False)
-    low_price = Column(Float, nullable=False)
-    close_price = Column(Float, nullable=False)
-    volume = Column(Float, nullable=False)
-    additional_indicators = Column(JSON)
-
-class RiskEvent(Base):
-    """
-    Модель для хранения событий риск-менеджмента
-    """
-    __tablename__ = 'risk_events'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    event_type = Column(String(50), nullable=False)  # stop_loss, take_profit, max_drawdown
-    symbol = Column(String(20))
-    strategy_name = Column(String(50))
-    trigger_value = Column(Float)
-    current_value = Column(Float)
-    action_taken = Column(String(100))
-    description = Column(Text)
-    severity = Column(String(20))  # low, medium, high, critical
-
-class APIRequest(Base):
-    """
-    Модель для хранения логов API запросов
-    """
-    __tablename__ = 'api_requests'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    endpoint = Column(String(200), nullable=False)
-    method = Column(String(10), nullable=False)  # GET, POST, PUT, DELETE
-    params = Column(JSON)
-    response_code = Column(Integer)
-    success = Column(Boolean, nullable=False)
-    error_message = Column(Text)
-    response_time = Column(Float)  # в миллисекундах
-    session_id = Column(String(36))
-
-class TickerData(Base):
-    """
-    Модель для хранения текущих рыночных данных (тикеров)
-    """
-    __tablename__ = 'ticker_data'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    symbol = Column(String(20), nullable=False, unique=True)
-    price = Column(Float, nullable=False)
-    change_24h = Column(Float, nullable=False)
-    volume_24h = Column(Float, nullable=False)
-    high_24h = Column(Float, nullable=False)
-    low_24h = Column(Float, nullable=False)
-    category = Column(String(20), default='spot')
-    risk_level = Column(String(10), default='medium')
-    last_updated = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-class PerformanceMetrics(Base):
-    """
-    Модель для хранения метрик производительности стратегий
-    """
-    __tablename__ = 'performance_metrics'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
-    strategy_name = Column(String(50))
-    symbol = Column(String(20))
-    period_start = Column(DateTime, nullable=False)
-    period_end = Column(DateTime, nullable=False)
-    total_trades = Column(Integer, default=0)
-    winning_trades = Column(Integer, default=0)
-    losing_trades = Column(Integer, default=0)
-    total_profit_loss = Column(Float, default=0.0)
-    max_drawdown = Column(Float, default=0.0)
-    sharpe_ratio = Column(Float)
-    win_rate = Column(Float)
-    avg_profit = Column(Float)
-    avg_loss = Column(Float)
-    additional_metrics = Column(JSON)
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Tuple
+from pathlib import Path
+import threading
+from contextlib import contextmanager
 
 class DatabaseManager:
     """
     Менеджер базы данных для торгового бота
-    Поддерживает разделение данных для testnet и mainnet режимов
+    Обеспечивает детальное логирование всех операций
     """
     
-    def __init__(self, db_path: Optional[str] = None, environment: str = "testnet"):
+    def __init__(self, db_path: Optional[str] = None):
         self.logger = logging.getLogger(__name__)
-        self.environment = environment
         
-        # Определяем путь к базе данных
-        if db_path:
-            self.db_path = Path(db_path)
+        # Путь к базе данных
+        if db_path is None:
+            db_dir = Path(__file__).parent.parent.parent / 'data'
+            db_dir.mkdir(exist_ok=True)
+            self.db_path = db_dir / 'trading_bot.db'
         else:
-            config_dir = Path.home() / ".bybit_trading_bot"
-            config_dir.mkdir(exist_ok=True)
-            
-            # Разделяем БД для testnet и mainnet
-            if environment == "mainnet":
-                self.db_path = config_dir / "trading_bot_mainnet.db"
-            else:
-                self.db_path = config_dir / "trading_bot_testnet.db"
+            self.db_path = Path(db_path)
         
-        # Создаем движок SQLAlchemy
-        self.engine = create_engine(
-            f"sqlite:///{self.db_path}",
-            echo=False,  # Установить True для отладки SQL запросов
-            pool_pre_ping=True,
-            connect_args={'check_same_thread': False}
-        )
+        # Блокировка для потокобезопасности
+        self._lock = threading.Lock()
         
-        # Создаем фабрику сессий
-        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        # Инициализация базы данных
+        self.init_database()
         
-        self.logger.info(f"Инициализирован менеджер БД ({self.environment}): {self.db_path}")
+        self.logger.info(f"Инициализирован менеджер БД: {self.db_path}")
     
-    def get_environment(self) -> str:
-        """
-        Получение текущего окружения (testnet/mainnet)
-        
-        Returns:
-            Строка с названием окружения
-        """
-        return self.environment
-    
-    def switch_environment(self, new_environment: str):
-        """
-        Переключение окружения БД (требует пересоздания менеджера)
-        
-        Args:
-            new_environment: Новое окружение (testnet/mainnet)
-        """
-        if new_environment not in ["testnet", "mainnet"]:
-            raise ValueError("Окружение должно быть 'testnet' или 'mainnet'")
-        
-        if new_environment != self.environment:
-            self.logger.warning(f"Переключение окружения с {self.environment} на {new_environment} требует пересоздания DatabaseManager")
-            raise RuntimeError("Для переключения окружения необходимо создать новый экземпляр DatabaseManager")
-    
-    def initialize_database(self):
-        """
-        Инициализация базы данных - создание всех таблиц
-        """
+    @contextmanager
+    def get_connection(self):
+        """Контекстный менеджер для безопасной работы с БД"""
+        conn = None
         try:
-            Base.metadata.create_all(bind=self.engine)
-            self.logger.info("База данных успешно инициализирована")
-            
-            # Создаем индексы для оптимизации запросов
-            self._create_indexes()
-            
-        except SQLAlchemyError as e:
-            self.logger.error(f"Ошибка инициализации базы данных: {e}")
+            conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+            conn.row_factory = sqlite3.Row  # Для доступа к колонкам по имени
+            yield conn
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            self.logger.error(f"Ошибка работы с БД: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
+    
+    def init_database(self):
+        """Инициализация структуры базы данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Таблица для логирования всех действий системы
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS system_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        level TEXT NOT NULL,
+                        component TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        details TEXT,
+                        execution_time_ms REAL,
+                        session_id TEXT,
+                        thread_id TEXT
+                    )
+                """)
+                
+                # Таблица торговых операций
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        order_type TEXT NOT NULL,
+                        quantity REAL NOT NULL,
+                        price REAL,
+                        order_id TEXT,
+                        status TEXT NOT NULL,
+                        pnl REAL,
+                        commission REAL,
+                        analysis_data TEXT,
+                        execution_time_ms REAL
+                    )
+                """)
+                
+                # Таблица для хранения позиций
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS positions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        symbol TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        size REAL NOT NULL,
+                        entry_price REAL NOT NULL,
+                        mark_price REAL,
+                        pnl REAL,
+                        leverage TEXT,
+                        position_value REAL,
+                        position_idx INTEGER,
+                        risk_id INTEGER,
+                        position_status TEXT,
+                        auto_add_margin INTEGER,
+                        position_data TEXT,
+                        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Таблица для хранения истории цен
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS price_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        symbol TEXT NOT NULL,
+                        price REAL NOT NULL,
+                        price_1h_ago REAL,
+                        price_24h_ago REAL,
+                        price_7d_ago REAL,
+                        price_30d_ago REAL,
+                        price_180d_ago REAL,
+                        volume_24h REAL,
+                        change_1h REAL,
+                        change_24h REAL,
+                        change_7d REAL,
+                        change_30d REAL,
+                        change_180d REAL,
+                        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Таблица для хранения доступных для торговли символов
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS available_symbols (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        symbol TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        base_coin TEXT NOT NULL,
+                        quote_coin TEXT NOT NULL,
+                        price_scale INTEGER,
+                        taker_fee REAL,
+                        maker_fee REAL,
+                        min_leverage REAL,
+                        max_leverage REAL,
+                        leverage_step REAL,
+                        min_price REAL,
+                        max_price REAL,
+                        tick_size REAL,
+                        min_order_qty REAL,
+                        max_order_qty REAL,
+                        qty_step REAL,
+                        post_only_max_order_qty REAL,
+                        symbol_status TEXT,
+                        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(symbol, category)
+                    )
+                """)
+                
+                # Индексы для оптимизации запросов
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs(timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_timestamp ON positions(timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_symbol ON price_history(symbol)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_timestamp ON price_history(timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_available_symbols_symbol ON available_symbols(symbol)")
+                
+                conn.commit()
+                self.logger.info("База данных инициализирована")
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка инициализации БД: {e}")
             raise
     
-    def _create_indexes(self):
-        """
-        Создание индексов для оптимизации запросов
-        """
-        indexes = [
-            ("idx_log_timestamp", "log_entries(timestamp)", "Индекс для временных меток логов"),
-            ("idx_log_level", "log_entries(level)", "Индекс для уровней логов"),
-            ("idx_log_logger", "log_entries(logger_name)", "Индекс для имен логгеров"),
-            ("idx_trade_timestamp", "trade_entries(timestamp)", "Индекс для временных меток торговых операций"),
-            ("idx_trade_symbol", "trade_entries(symbol)", "Индекс для символов торговых операций"),
-            ("idx_trade_strategy", "trade_entries(strategy_name)", "Индекс для стратегий торговых операций"),
-            ("idx_strategy_timestamp", "strategy_logs(timestamp)", "Индекс для временных меток логов стратегий"),
-            ("idx_strategy_name", "strategy_logs(strategy_name)", "Индекс для имен стратегий"),
-            ("idx_market_symbol_time", "market_data(symbol, timestamp)", "Составной индекс для рыночных данных"),
-            ("idx_market_timeframe", "market_data(timeframe)", "Индекс для таймфреймов рыночных данных")
-        ]
-        
+    def log_system_action(self, level: str, component: str, action: str, 
+                         details: Optional[Dict] = None, execution_time_ms: Optional[float] = None,
+                         session_id: Optional[str] = None):
+        """Логирование системного действия"""
         try:
-            # Используем сессию вместо raw connection для совместимости с SQLite
-            with self.get_session() as session:
-                for index_name, table_columns, description in indexes:
-                    try:
-                        sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_columns}"
-                        session.execute(text(sql))
-                        self.logger.debug(f"Создан индекс: {description}")
-                    except Exception as index_error:
-                        self.logger.error(f"Ошибка создания индекса {index_name}: {index_error}")
-                        # Продолжаем создание остальных индексов
-                        continue
-                
-                session.commit()
-                self.logger.info("Процесс создания индексов завершен")
-                
-        except Exception as e:
-            self.logger.error(f"Общая ошибка создания индексов: {e}")
-            # Не поднимаем исключение, чтобы не блокировать инициализацию БД
-    
-    def get_session(self) -> Session:
-        """
-        Получение сессии базы данных
-        """
-        return self.SessionLocal()
-    
-    def log_entry(self, log_data: Dict[str, Any]):
-        """
-        Запись лога в базу данных
-        """
-        try:
-            with self.get_session() as session:
-                log_entry = LogEntry(
-                    timestamp=log_data.get('timestamp', datetime.utcnow()),
-                    level=log_data.get('level', 'INFO'),
-                    logger_name=log_data.get('logger_name', ''),
-                    module=log_data.get('module'),
-                    function=log_data.get('function'),
-                    line_number=log_data.get('line_number'),
-                    message=log_data.get('message', ''),
-                    exception=log_data.get('exception'),
-                    session_id=log_data.get('session_id')
-                )
-                session.add(log_entry)
-                session.commit()
-                
-        except Exception as e:
-            # Избегаем рекурсивного логирования
-            print(f"Ошибка записи лога в БД: {e}")
-    
-    def log_trade(self, trade_data: Dict[str, Any]):
-        """
-        Запись торговой операции в базу данных
-        """
-        try:
-            with self.get_session() as session:
-                trade_entry = TradeEntry(
-                    timestamp=trade_data.get('timestamp', datetime.utcnow()),
-                    order_id=trade_data.get('order_id'),
-                    symbol=trade_data.get('symbol'),
-                    side=trade_data.get('side'),
-                    order_type=trade_data.get('order_type'),
-                    quantity=trade_data.get('quantity'),
-                    price=trade_data.get('price'),
-                    executed_price=trade_data.get('executed_price'),
-                    executed_quantity=trade_data.get('executed_quantity'),
-                    status=trade_data.get('status'),
-                    strategy_name=trade_data.get('strategy_name'),
-                    profit_loss=trade_data.get('profit_loss'),
-                    commission=trade_data.get('commission'),
-                    environment=trade_data.get('environment', 'testnet'),
-                    additional_data=trade_data.get('additional_data')
-                )
-                session.add(trade_entry)
-                session.commit()
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка записи торговой операции в БД: {e}")
-    
-    def log_strategy_action(self, strategy_data: Dict[str, Any]):
-        """
-        Запись действия стратегии в базу данных
-        """
-        try:
-            with self.get_session() as session:
-                strategy_log = StrategyLog(
-                    timestamp=strategy_data.get('timestamp', datetime.utcnow()),
-                    strategy_name=strategy_data.get('strategy_name'),
-                    symbol=strategy_data.get('symbol'),
-                    action=strategy_data.get('action'),
-                    technical_details=strategy_data.get('technical_details'),
-                    human_readable=strategy_data.get('human_readable'),
-                    data=strategy_data.get('data'),
-                    session_id=strategy_data.get('session_id')
-                )
-                session.add(strategy_log)
-                session.commit()
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка записи лога стратегии в БД: {e}")
-    
-    def save_market_data(self, market_data: Dict[str, Any]):
-        """
-        Сохранение рыночных данных
-        """
-        try:
-            with self.get_session() as session:
-                data_entry = MarketData(
-                    timestamp=market_data.get('timestamp', datetime.utcnow()),
-                    symbol=market_data.get('symbol'),
-                    timeframe=market_data.get('timeframe'),
-                    open_price=market_data.get('open_price'),
-                    high_price=market_data.get('high_price'),
-                    low_price=market_data.get('low_price'),
-                    close_price=market_data.get('close_price'),
-                    volume=market_data.get('volume'),
-                    additional_indicators=market_data.get('additional_indicators')
-                )
-                session.add(data_entry)
-                session.commit()
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка сохранения рыночных данных: {e}")
-    
-    def log_risk_event(self, risk_data: Dict[str, Any]):
-        """
-        Запись события риск-менеджмента
-        """
-        try:
-            with self.get_session() as session:
-                risk_event = RiskEvent(
-                    timestamp=risk_data.get('timestamp', datetime.utcnow()),
-                    event_type=risk_data.get('event_type'),
-                    symbol=risk_data.get('symbol'),
-                    strategy_name=risk_data.get('strategy_name'),
-                    trigger_value=risk_data.get('trigger_value'),
-                    current_value=risk_data.get('current_value'),
-                    action_taken=risk_data.get('action_taken'),
-                    description=risk_data.get('description'),
-                    severity=risk_data.get('severity', 'medium')
-                )
-                session.add(risk_event)
-                session.commit()
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка записи события риск-менеджмента: {e}")
-    
-    def get_strategy_logs(self, strategy_name: str, limit: int = 100) -> List[Dict]:
-        """
-        Получение логов стратегии
-        """
-        try:
-            with self.get_session() as session:
-                logs = session.query(StrategyLog).filter(
-                    StrategyLog.strategy_name == strategy_name
-                ).order_by(StrategyLog.timestamp.desc()).limit(limit).all()
-                
-                return [{
-                    'timestamp': log.timestamp,
-                    'action': log.action,
-                    'technical_details': log.technical_details,
-                    'human_readable': log.human_readable,
-                    'symbol': log.symbol,
-                    'data': log.data
-                } for log in logs]
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка получения логов стратегии: {e}")
-            return []
-    
-    def get_trade_history(self, symbol: str = None, strategy: str = None, 
-                         days: int = 30) -> List[Dict]:
-        """
-        Получение истории торговых операций
-        """
-        try:
-            with self.get_session() as session:
-                query = session.query(TradeEntry)
-                
-                # Фильтрация по периоду
-                start_date = datetime.utcnow() - timedelta(days=days)
-                query = query.filter(TradeEntry.timestamp >= start_date)
-                
-                # Фильтрация по символу
-                if symbol:
-                    query = query.filter(TradeEntry.symbol == symbol)
-                
-                # Фильтрация по стратегии
-                if strategy:
-                    query = query.filter(TradeEntry.strategy_name == strategy)
-                
-                trades = query.order_by(TradeEntry.timestamp.desc()).all()
-                
-                return [{
-                    'timestamp': trade.timestamp,
-                    'order_id': trade.order_id,
-                    'symbol': trade.symbol,
-                    'side': trade.side,
-                    'quantity': trade.quantity,
-                    'price': trade.price,
-                    'executed_price': trade.executed_price,
-                    'status': trade.status,
-                    'strategy_name': trade.strategy_name,
-                    'profit_loss': trade.profit_loss,
-                    'environment': trade.environment
-                } for trade in trades]
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка получения истории торговли: {e}")
-            return []
-    
-    def cleanup_old_data(self, days_to_keep: int = 90):
-        """
-        Очистка старых данных из базы
-        """
-        try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
-            
-            with self.get_session() as session:
-                # Удаляем старые логи
-                deleted_logs = session.query(LogEntry).filter(
-                    LogEntry.timestamp < cutoff_date
-                ).delete()
-                
-                # Удаляем старые рыночные данные (кроме дневных)
-                deleted_market = session.query(MarketData).filter(
-                    MarketData.timestamp < cutoff_date,
-                    MarketData.timeframe != '1d'
-                ).delete()
-                
-                session.commit()
-                
-                self.logger.info(f"Очищено {deleted_logs} записей логов и {deleted_market} записей рыночных данных")
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка очистки старых данных: {e}")
-    
-    def backup_database(self, backup_path: Optional[str] = None):
-        """
-        Создание резервной копии базы данных
-        """
-        try:
-            if not backup_path:
-                backup_dir = self.db_path.parent / "backups"
-                backup_dir.mkdir(exist_ok=True)
-                backup_path = backup_dir / f"trading_bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-            
-            # Простое копирование файла SQLite
-            import shutil
-            shutil.copy2(self.db_path, backup_path)
-            
-            self.logger.info(f"Резервная копия создана: {backup_path}")
-            return str(backup_path)
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка создания резервной копии: {e}")
-            return None
-    
-    def log_performance(self, performance_data: Dict[str, Any]):
-        """
-        Запись метрик производительности в базу данных
-        """
-        try:
-            with self.get_session() as session:
-                # Определяем период
-                period_start = performance_data.get('period_start', datetime.utcnow() - timedelta(days=1))
-                period_end = performance_data.get('period_end', datetime.utcnow())
-                
-                performance_entry = PerformanceMetrics(
-                    timestamp=performance_data.get('timestamp', datetime.utcnow()),
-                    strategy_name=performance_data.get('strategy_name'),
-                    symbol=performance_data.get('symbol'),
-                    period_start=period_start,
-                    period_end=period_end,
-                    total_trades=performance_data.get('total_trades', 0),
-                    winning_trades=performance_data.get('profitable_trades', 0),
-                    losing_trades=performance_data.get('total_trades', 0) - performance_data.get('profitable_trades', 0),
-                    total_profit_loss=performance_data.get('total_profit', 0.0),
-                    max_drawdown=performance_data.get('max_drawdown', 0.0),
-                    sharpe_ratio=performance_data.get('sharpe_ratio'),
-                    win_rate=performance_data.get('win_rate', 0.0),
-                    avg_profit=performance_data.get('avg_profit'),
-                    avg_loss=performance_data.get('avg_loss'),
-                    additional_metrics=performance_data.get('additional_metrics')
-                )
-                session.add(performance_entry)
-                session.commit()
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка записи метрик производительности в БД: {e}")
-    
-    def get_performance_summary(self, strategy_name: str = None, 
-                              days: int = 30) -> Dict[str, Any]:
-        """
-        Получение сводки производительности
-        """
-        try:
-            with self.get_session() as session:
-                query = session.query(TradeEntry)
-                
-                # Фильтрация по периоду
-                start_date = datetime.utcnow() - timedelta(days=days)
-                query = query.filter(TradeEntry.timestamp >= start_date)
-                
-                # Фильтрация по стратегии
-                if strategy_name:
-                    query = query.filter(TradeEntry.strategy_name == strategy_name)
-                
-                trades = query.all()
-                
-                if not trades:
-                    return {'total_trades': 0}
-                
-                # Расчет метрик
-                total_trades = len(trades)
-                winning_trades = len([t for t in trades if t.profit_loss and t.profit_loss > 0])
-                losing_trades = len([t for t in trades if t.profit_loss and t.profit_loss < 0])
-                
-                total_pnl = sum([t.profit_loss for t in trades if t.profit_loss])
-                win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-                
-                return {
-                    'total_trades': total_trades,
-                    'winning_trades': winning_trades,
-                    'losing_trades': losing_trades,
-                    'win_rate': round(win_rate, 2),
-                    'total_pnl': round(total_pnl, 4) if total_pnl else 0,
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка получения сводки производительности: {e}")
-            return {'total_trades': 0}
-    
-    def log_api_request(self, endpoint: str, method: str, params: Dict = None, 
-                       response_code: int = None, success: bool = True, 
-                       error_message: str = None, response_time: float = None):
-        """
-        Запись лога API запроса в базу данных
-        """
-        try:
-            with self.get_session() as session:
-                api_request = APIRequest(
-                    endpoint=endpoint,
-                    method=method.upper(),
-                    params=params,
-                    response_code=response_code,
-                    success=success,
-                    error_message=error_message,
-                    response_time=response_time
-                )
-                session.add(api_request)
-                session.commit()
-                
-        except Exception as e:
-            self.logger.error(f"Ошибка записи лога API запроса: {e}")
-    
-    def save_ticker_data(self, ticker_data: List[Dict[str, Any]]):
-        """
-        Сохранение данных тикеров в базу данных
-        
-        Args:
-            ticker_data: Список словарей с данными тикеров
-        """
-        try:
-            with self.get_session() as session:
-                for ticker in ticker_data:
-                    # Проверяем существует ли запись для данного символа
-                    existing = session.query(TickerData).filter_by(symbol=ticker['symbol']).first()
+            with self._lock:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
                     
-                    if existing:
-                        # Обновляем существующую запись
-                        existing.price = ticker['price']
-                        existing.change_24h = ticker['change_24h']
-                        existing.volume_24h = ticker['volume_24h']
-                        existing.high_24h = ticker['high_24h']
-                        existing.low_24h = ticker['low_24h']
-                        existing.risk_level = ticker.get('risk_level', 'medium')
-                        existing.last_updated = datetime.utcnow()
-                    else:
-                        # Создаем новую запись
-                        ticker_entry = TickerData(
-                            symbol=ticker['symbol'],
-                            price=ticker['price'],
-                            change_24h=ticker['change_24h'],
-                            volume_24h=ticker['volume_24h'],
-                            high_24h=ticker['high_24h'],
-                            low_24h=ticker['low_24h'],
-                            risk_level=ticker.get('risk_level', 'medium')
-                        )
-                        session.add(ticker_entry)
-                
-                session.commit()
-                self.logger.info(f"Сохранено {len(ticker_data)} записей тикеров")
-                
-        except SQLAlchemyError as e:
-            self.logger.error(f"Ошибка сохранения данных тикеров: {e}")
-            raise
-    
-    def get_cached_ticker_data(self, max_age_minutes: int = 30) -> List[Dict[str, Any]]:
-        """
-        Получение кэшированных данных тикеров
-        
-        Args:
-            max_age_minutes: Максимальный возраст данных в минутах
-            
-        Returns:
-            Список словарей с данными тикеров
-        """
-        try:
-            with self.get_session() as session:
-                cutoff_time = datetime.utcnow() - timedelta(minutes=max_age_minutes)
-                
-                tickers = session.query(TickerData).filter(
-                    TickerData.last_updated >= cutoff_time
-                ).order_by(TickerData.last_updated.desc()).all()
-                
-                result = []
-                for ticker in tickers:
-                    result.append({
-                        'symbol': ticker.symbol,
-                        'price': ticker.price,
-                        'change_24h': ticker.change_24h,
-                        'volume_24h': ticker.volume_24h,
-                        'high_24h': ticker.high_24h,
-                        'low_24h': ticker.low_24h,
-                        'risk_level': ticker.risk_level,
-                        'last_updated': ticker.last_updated
-                    })
-                
-                self.logger.info(f"Загружено {len(result)} кэшированных тикеров")
-                return result
-                
-        except SQLAlchemyError as e:
-            self.logger.error(f"Ошибка загрузки кэшированных данных тикеров: {e}")
-            return []
-    
-    def get_outdated_tickers(self, max_age_minutes: int = 30) -> List[str]:
-        """
-        Получение списка символов с устаревшими данными
-        
-        Args:
-            max_age_minutes: Максимальный возраст данных в минутах
-            
-        Returns:
-            Список символов с устаревшими данными
-        """
-        try:
-            with self.get_session() as session:
-                cutoff_time = datetime.utcnow() - timedelta(minutes=max_age_minutes)
-                
-                outdated = session.query(TickerData.symbol).filter(
-                    TickerData.last_updated < cutoff_time
-                ).all()
-                
-                return [ticker.symbol for ticker in outdated]
-                
-        except SQLAlchemyError as e:
-            self.logger.error(f"Ошибка получения устаревших тикеров: {e}")
-            return []
-
-    def close(self):
-        """
-        Закрытие соединения с базой данных
-        """
-        try:
-            self.engine.dispose()
-            self.logger.info("Соединение с базой данных закрыто")
+                    cursor.execute("""
+                        INSERT INTO system_logs 
+                        (level, component, action, details, execution_time_ms, session_id, thread_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        level,
+                        component,
+                        action,
+                        json.dumps(details) if details else None,
+                        execution_time_ms,
+                        session_id,
+                        str(threading.current_thread().ident)
+                    ))
+                    
+                    conn.commit()
+                    
         except Exception as e:
-            self.logger.error(f"Ошибка закрытия соединения с БД: {e}")
+            self.logger.error(f"Ошибка логирования системного действия: {e}")
+    
+    def log_trade(self, trade_info: Dict):
+        """Логирование торговой операции"""
+        try:
+            with self._lock:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    cursor.execute("""
+                        INSERT INTO trades 
+                        (symbol, side, order_type, quantity, price, order_id, status, 
+                         pnl, commission, analysis_data, execution_time_ms)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        trade_info.get('symbol'),
+                        trade_info.get('side'),
+                        trade_info.get('order_type', 'Market'),
+                        trade_info.get('size', 0),
+                        trade_info.get('price'),
+                        trade_info.get('order_id'),
+                        trade_info.get('status', 'Executed'),
+                        trade_info.get('pnl'),
+                        trade_info.get('commission'),
+                        json.dumps(trade_info.get('analysis', {})),
+                        trade_info.get('execution_time_ms')
+                    ))
+                    
+                    conn.commit()
+                    
+                    # Логирование системного действия
+                    self.log_system_action(
+                        'INFO', 'TRADING', 'TRADE_EXECUTED',
+                        {'symbol': trade_info.get('symbol'), 'side': trade_info.get('side')}
+                    )
+                    
+        except Exception as e:
+            self.logger.error(f"Ошибка логирования торговли: {e}")
+    
+    def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
+        """Получение последних торговых операций"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if symbol:
+                    cursor.execute("""
+                        SELECT * FROM trades 
+                        WHERE symbol = ?
+                        ORDER BY timestamp DESC 
+                        LIMIT ?
+                    """, (symbol, limit))
+                else:
+                    cursor.execute("""
+                        SELECT * FROM trades 
+                        ORDER BY timestamp DESC 
+                        LIMIT ?
+                    """, (limit,))
+                
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка получения торговых операций: {e}")
+            return []
+            
+    def save_positions(self, positions_data):
+        """Сохранение позиций в базу данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                # Сначала удаляем все старые записи, так как мы всегда сохраняем актуальное состояние
+                cursor.execute("DELETE FROM positions")
+                
+                # Вставляем новые данные
+                for position in positions_data:
+                    position_data_json = json.dumps(position)
+                    cursor.execute("""
+                        INSERT INTO positions (
+                            symbol, category, side, size, entry_price, mark_price, pnl,
+                            leverage, position_value, position_idx, risk_id, position_status,
+                            auto_add_margin, position_data, last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (
+                        position.get('symbol', ''),
+                        position.get('category', ''),
+                        position.get('side', ''),
+                        float(position.get('size', 0)),
+                        float(position.get('entryPrice', 0)),
+                        float(position.get('markPrice', 0)),
+                        float(position.get('unrealisedPnl', 0)),
+                        position.get('leverage', ''),
+                        float(position.get('positionValue', 0)),
+                        int(position.get('positionIdx', 0)),
+                        int(position.get('riskId', 0)) if position.get('riskId') else None,
+                        position.get('positionStatus', ''),
+                        int(position.get('autoAddMargin', 0)),
+                        position_data_json
+                    ))
+                conn.commit()
+                self.logger.info(f"Сохранено {len(positions_data)} позиций в базу данных")
+                return True
+        except Exception as e:
+            self.logger.error(f"Ошибка при сохранении позиций в базу данных: {e}")
+            return False
+            
+    def get_positions(self, limit=100):
+        """Получение текущих позиций из базы данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM positions 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                """, (limit,))
+                return cursor.fetchall()
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении позиций из базы данных: {e}")
+            return []
+            
+    def get_price_history(self, symbol=None):
+        """Получение истории цен из базы данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if symbol:
+                    cursor.execute("""
+                        SELECT * FROM price_history 
+                        WHERE symbol = ?
+                    """, (symbol,))
+                    return cursor.fetchone()
+                else:
+                    cursor.execute("""
+                        SELECT * FROM price_history
+                    """)
+                    return cursor.fetchall()
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении истории цен из базы данных: {e}")
+            return None
+            
+    def save_price_history(self, symbol, price_data):
+        """Сохранение истории цен в базу данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Проверяем, есть ли уже запись для этого символа
+                cursor.execute("SELECT id FROM price_history WHERE symbol = ?", (symbol,))
+                existing_record = cursor.fetchone()
+                
+                if existing_record:
+                    # Обновляем существующую запись
+                    cursor.execute("""
+                        UPDATE price_history SET 
+                            price = ?, price_1h_ago = ?, price_24h_ago = ?, 
+                            price_7d_ago = ?, price_30d_ago = ?, price_180d_ago = ?,
+                            volume_24h = ?, change_1h = ?, change_24h = ?, 
+                            change_7d = ?, change_30d = ?, change_180d = ?,
+                            last_updated = CURRENT_TIMESTAMP
+                        WHERE symbol = ?
+                    """, (
+                        float(price_data.get('price', 0)),
+                        float(price_data.get('price_1h_ago', 0)),
+                        float(price_data.get('price_24h_ago', 0)),
+                        float(price_data.get('price_7d_ago', 0)),
+                        float(price_data.get('price_30d_ago', 0)),
+                        float(price_data.get('price_180d_ago', 0)),
+                        float(price_data.get('volume_24h', 0)),
+                        float(price_data.get('change_1h', 0)),
+                        float(price_data.get('change_24h', 0)),
+                        float(price_data.get('change_7d', 0)),
+                        float(price_data.get('change_30d', 0)),
+                        float(price_data.get('change_180d', 0)),
+                        symbol
+                    ))
+                else:
+                    # Вставляем новую запись
+                    cursor.execute("""
+                        INSERT INTO price_history (
+                            symbol, price, price_1h_ago, price_24h_ago, price_7d_ago,
+                            price_30d_ago, price_180d_ago, volume_24h, change_1h,
+                            change_24h, change_7d, change_30d, change_180d
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        symbol,
+                        float(price_data.get('price', 0)),
+                        float(price_data.get('price_1h_ago', 0)),
+                        float(price_data.get('price_24h_ago', 0)),
+                        float(price_data.get('price_7d_ago', 0)),
+                        float(price_data.get('price_30d_ago', 0)),
+                        float(price_data.get('price_180d_ago', 0)),
+                        float(price_data.get('volume_24h', 0)),
+                        float(price_data.get('change_1h', 0)),
+                        float(price_data.get('change_24h', 0)),
+                        float(price_data.get('change_7d', 0)),
+                        float(price_data.get('change_30d', 0)),
+                        float(price_data.get('change_180d', 0))
+                    ))
+                conn.commit()
+                self.logger.info(f"Сохранена история цен для {symbol} в базу данных")
+                return True
+        except Exception as e:
+            self.logger.error(f"Ошибка при сохранении истории цен в базу данных: {e}")
+            return False
+            
+    def get_price_history(self, symbol=None, limit=100):
+        """Получение истории цен из базы данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if symbol:
+                    cursor.execute("""
+                        SELECT * FROM price_history 
+                        WHERE symbol = ? 
+                        ORDER BY timestamp DESC 
+                        LIMIT ?
+                    """, (symbol, limit))
+                else:
+                    cursor.execute("""
+                        SELECT * FROM price_history 
+                        ORDER BY timestamp DESC 
+                        LIMIT ?
+                    """, (limit,))
+                return cursor.fetchall()
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении истории цен из базы данных: {e}")
+            return []
+            
+    def save_available_symbols(self, symbols_data):
+        """Сохранение доступных символов в базу данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                # Сначала удаляем все старые записи, так как мы всегда сохраняем актуальное состояние
+                cursor.execute("DELETE FROM available_symbols")
+                
+                # Вставляем новые данные
+                for symbol_data in symbols_data:
+                    cursor.execute("""
+                        INSERT INTO available_symbols (
+                            symbol, category, base_coin, quote_coin, price_scale,
+                            taker_fee, maker_fee, min_leverage, max_leverage, leverage_step,
+                            min_price, max_price, tick_size, min_order_qty, max_order_qty,
+                            qty_step, post_only_max_order_qty, symbol_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        symbol_data.get('symbol', ''),
+                        symbol_data.get('category', ''),
+                        symbol_data.get('baseCoin', ''),
+                        symbol_data.get('quoteCoin', ''),
+                        int(symbol_data.get('priceScale', 0)),
+                        float(symbol_data.get('takerFee', 0)),
+                        float(symbol_data.get('makerFee', 0)),
+                        float(symbol_data.get('minLeverage', 0)),
+                        float(symbol_data.get('maxLeverage', 0)),
+                        float(symbol_data.get('leverageStep', 0)),
+                        float(symbol_data.get('minPrice', 0)),
+                        float(symbol_data.get('maxPrice', 0)),
+                        float(symbol_data.get('tickSize', 0)),
+                        float(symbol_data.get('minOrderQty', 0)),
+                        float(symbol_data.get('maxOrderQty', 0)),
+                        float(symbol_data.get('qtyStep', 0)),
+                        float(symbol_data.get('postOnlyMaxOrderQty', 0)),
+                        symbol_data.get('status', '')
+                    ))
+                conn.commit()
+                self.logger.info(f"Сохранено {len(symbols_data)} доступных символов в базу данных")
+                return True
+        except Exception as e:
+            self.logger.error(f"Ошибка при сохранении доступных символов в базу данных: {e}")
+            return False
+            
+    def get_available_symbols(self, category=None, limit=1000):
+        """Получение доступных символов из базы данных"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if category:
+                    cursor.execute("""
+                        SELECT * FROM available_symbols 
+                        WHERE category = ? 
+                        ORDER BY symbol ASC 
+                        LIMIT ?
+                    """, (category, limit))
+                else:
+                    cursor.execute("""
+                        SELECT * FROM available_symbols 
+                        ORDER BY symbol ASC 
+                        LIMIT ?
+                    """, (limit,))
+                return cursor.fetchall()
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении доступных символов из базы данных: {e}")
+            return []
+    
+    def get_system_logs(self, level: Optional[str] = None, component: Optional[str] = None,
+                       hours_back: int = 24, limit: int = 1000) -> List[Dict]:
+        """Получение системных логов"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                query = """
+                    SELECT * FROM system_logs 
+                    WHERE timestamp >= datetime('now', '-{} hours')
+                """.format(hours_back)
+                
+                params = []
+                
+                if level:
+                    query += " AND level = ?"
+                    params.append(level)
+                
+                if component:
+                    query += " AND component = ?"
+                    params.append(component)
+                
+                query += " ORDER BY timestamp DESC LIMIT ?"
+                params.append(limit)
+                
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                
+                return [dict(row) for row in rows]
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка получения системных логов: {e}")
+            return []
+    
+    def log_account_snapshot(self, account_data: Dict[str, Any]):
+        """Логирование снимка состояния аккаунта"""
+        try:
+            self.log_system_action(
+                level='INFO',
+                component='ACCOUNT',
+                action='account_snapshot',
+                details=account_data,
+                execution_time_ms=account_data.get('execution_time_ms'),
+                session_id=account_data.get('session_id')
+            )
+        except Exception as e:
+            self.logger.error(f"Ошибка логирования снимка аккаунта: {e}")
+    
+    def log_entry(self, entry: Dict[str, Any]):
+        """Универсальный метод логирования с поддержкой нового формата"""
+        try:
+            level = entry.get('level', 'INFO')
+            logger_name = entry.get('logger_name', 'SYSTEM')
+            message = entry.get('message', '')
+            session_id = entry.get('session_id')
+            exception = entry.get('exception')
+            
+            # Формирование деталей для старого формата
+            details = {}
+            if exception:
+                details['exception'] = str(exception)
+                details['exception_type'] = type(exception).__name__ if hasattr(exception, '__class__') else 'Exception'
+            
+            # Используем существующий метод log_system_action
+            self.log_system_action(
+                level=level,
+                component=logger_name,
+                action=message,
+                details=details if details else None,
+                session_id=session_id
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка универсального логирования: {e}")

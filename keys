@@ -1,12 +1,14 @@
-# Bybit API Keys
-# Mainnet keys
-BYBIT_API_KEY=l5RYlKwsjcEDMwWKcH
-BYBIT_API_SECRET=B9gx3nIb8GNXk7wGj9ayEjtssMxcMYB0Z5qy
+# Файл с API ключами для Bybit Trading Bot
+# ВАЖНО: Не делитесь этим файлом и не загружайте в публичные репозитории!
 
-# Testnet keys
+# Bybit API ключи для mainnet
+BYBIT_API_KEY=9HlqDp2h1HwSP8Ydnk
+BYBIT_API_SECRET=hXpgFc1Wd97IzRuqBV96wCcScH2s7LDLSKij
+
+# Bybit API ключи для testnet
 BYBIT_TESTNET_API_KEY=9HlqDp2h1HwSP8Ydnk
 BYBIT_TESTNET_API_SECRET=hXpgFc1Wd97IzRuqBV96wCcScH2s7LDLSKij
 
-# Telegram Bot
+# Telegram бот
 TELEGRAM_BOT_TOKEN=7531175068:AAEojRSOkWGcnhNq-KikeJfjQSMyHSed1a0
 TELEGRAM_CHAT_ID=377042639

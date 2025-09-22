@@ -1,622 +1,602 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bybit API клиент
-
-Обеспечивает безопасное взаимодействие с Bybit API:
-- Аутентификация и подписание запросов
-- Обработка ошибок и retry логика
-- Rate limiting
-- Кэширование данных
-- Поддержка testnet и mainnet
+Bybit API клиент для торгового бота
+Безопасное взаимодействие с Bybit API
 """
 
-import logging
 import time
 import hmac
 import hashlib
+import requests
 import json
-import threading
-from typing import Dict, List, Any, Optional, Union
+import logging
+from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+import threading
+from decimal import Decimal
 
-import aiohttp
-import asyncio
-from pybit.unified_trading import HTTP
-from pybit.exceptions import InvalidRequestError, FailedRequestError
-
-class BybitAPIError(Exception):
-    """Базовый класс для ошибок API"""
-    pass
-
-class BybitRateLimitError(BybitAPIError):
-    """Ошибка превышения лимита запросов"""
-    pass
-
-class BybitAuthError(BybitAPIError):
-    """Ошибка аутентификации"""
-    pass
 
 class RateLimiter:
-    """
-    Rate limiter для контроля частоты запросов к API
-    """
+    """Контроль частоты запросов к API"""
     
     def __init__(self, max_requests: int = 120, time_window: int = 60):
         self.max_requests = max_requests
         self.time_window = time_window
         self.requests = []
         self.lock = threading.Lock()
-        self.window_start = time.time()
     
-    @property
-    def requests_made(self) -> int:
-        """
-        Количество запросов, сделанных в текущем временном окне
-        """
-        now = time.time()
-        # Фильтруем запросы в текущем временном окне
-        current_requests = [req_time for req_time in self.requests 
-                          if now - req_time < self.time_window]
-        return len(current_requests)
-    
-    def acquire(self):
-        """
-        Получение разрешения на выполнение запроса
-        """
+    def wait_if_needed(self):
+        """Ожидание если превышен лимит запросов"""
         with self.lock:
             now = time.time()
-            
             # Удаляем старые запросы
-            old_count = len(self.requests)
             self.requests = [req_time for req_time in self.requests 
                            if now - req_time < self.time_window]
             
-            # Обновляем начало окна, если были удалены старые запросы
-            if len(self.requests) < old_count or not self.requests:
-                self.window_start = now
-            
-            # Проверяем лимит
             if len(self.requests) >= self.max_requests:
-                sleep_time = self.time_window - (now - self.requests[0])
+                sleep_time = self.time_window - (now - self.requests[0]) + 1
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                    return self.acquire()
+                    self.requests = []
             
-            # Добавляем текущий запрос
             self.requests.append(now)
 
+
 class BybitClient:
-    """
-    Основной клиент для работы с Bybit API
-    """
+    """Клиент для работы с Bybit API"""
     
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True, 
-                 config_manager=None, db_manager=None):
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
-        self.config = config_manager
-        self.db = db_manager
-        self.logger = logging.getLogger(__name__)
+        self.recv_window = 20000  # Увеличиваем recv_window для избежания ошибок синхронизации
         
-        # Инициализация pybit клиента с увеличенным таймаутом
-        self.client = HTTP(
-            api_key=api_key,
-            api_secret=api_secret,
-            testnet=testnet,
-            timeout=30  # Увеличиваем таймаут до 30 секунд
-        )
+        # URLs для API
+        if testnet:
+            self.base_url = "https://api-testnet.bybit.com"
+        else:
+            self.base_url = "https://api.bybit.com"
         
         # Rate limiter
         self.rate_limiter = RateLimiter()
         
         # Кэш для данных
         self.cache = {}
-        self.cache_ttl = {}
+        self.cache_timeout = 30  # секунд
         
-        # Статистика API
-        self.api_stats = {
-            "total_requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
-            "rate_limit_hits": 0,
-            "last_request_time": None
+        # Настройка логирования
+        self.logger = logging.getLogger(__name__)
+        
+        # Сессия для HTTP запросов
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'User-Agent': 'TradingBot/1.0'
+        })
+    
+    def _generate_signature(self, timestamp: str, payload: str) -> str:
+        """Генерация подписи для запроса согласно спецификации Bybit V5
+        
+        Строка для подписи: timestamp + api_key + recv_window + payload
+        где payload - это query string для GET или raw body для POST
+        """
+        # Очистка API ключа и секрета от пробелов и невидимых символов
+        api_key = self.api_key.strip()
+        api_secret = self.api_secret.strip()
+        
+        # Формирование строки для подписи
+        sign_str = f"{timestamp}{api_key}{self.recv_window}{payload}"
+        
+        self.logger.debug(f"Строка для подписи: {sign_str}")
+        
+        # Генерация подписи
+        return hmac.new(
+            api_secret.encode('utf-8'),
+            sign_str.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+    
+    def _get_server_time_raw(self) -> int:
+        """Получение времени сервера без аутентификации"""
+        try:
+            url = f"{self.base_url}/v5/market/time"
+            response = self.session.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            if data.get('retCode') == 0:
+                return int(data.get('result', {}).get('timeSecond', 0)) * 1000
+        except:
+            pass
+        return int(time.time() * 1000)
+    
+    def _make_request(self, method: str, endpoint: str, params: Dict = None, body: Dict = None) -> Dict:
+        """Выполнение HTTP запроса к API"""
+        self.rate_limiter.wait_if_needed()
+        
+        url = f"{self.base_url}{endpoint}"
+        # Получаем серверное время для синхронизации
+        timestamp = str(self._get_server_time_raw())
+        
+        # Подготовка query string для GET запросов
+        query_string = ''
+        if params and method.upper() == 'GET':
+            sorted_params = sorted(params.items())
+            query_string = '&'.join([f"{k}={v}" for k, v in sorted_params])
+        
+        # Подготовка body для POST запросов
+        body_str = ''
+        if body is not None and method.upper() != 'GET':
+            body_str = json.dumps(body, separators=(',', ':'))
+        elif params and method.upper() != 'GET':
+            body_str = json.dumps(params, separators=(',', ':'))
+        
+        # Определение payload для подписи
+        payload = query_string if method.upper() == 'GET' else body_str
+        
+        # Генерация подписи
+        signature = self._generate_signature(timestamp, payload)
+        
+        # Заголовки
+        headers = {
+            'X-BAPI-API-KEY': self.api_key,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-SIGN': signature,
+            'X-BAPI-RECV-WINDOW': str(self.recv_window),
+            'Content-Type': 'application/json'
         }
-        
-        self.logger.info(f"Bybit клиент инициализирован (testnet: {testnet})")
-    
-    def _get_cache_key(self, method: str, params: Dict[str, Any]) -> str:
-        """
-        Генерация ключа для кэша
-        """
-        params_str = json.dumps(params, sort_keys=True)
-        return f"{method}:{hashlib.md5(params_str.encode()).hexdigest()}"
-    
-    def _is_cache_valid(self, cache_key: str, ttl_seconds: int = 30) -> bool:
-        """
-        Проверка валидности кэша
-        """
-        if cache_key not in self.cache:
-            return False
-        
-        cache_time = self.cache_ttl.get(cache_key, 0)
-        return time.time() - cache_time < ttl_seconds
-    
-    def _set_cache(self, cache_key: str, data: Any):
-        """
-        Сохранение данных в кэш
-        """
-        self.cache[cache_key] = data
-        self.cache_ttl[cache_key] = time.time()
-    
-    def _make_request_with_retry(self, method: str, endpoint: str, params: Dict[str, Any] = None, 
-                                     use_cache: bool = True, cache_ttl: int = 30, max_retries: int = 3) -> Dict[str, Any]:
-        """
-        Выполнение запроса к API с retry логикой для таймаутов
-        """
-        last_error = None
-        
-        for attempt in range(max_retries + 1):
-            try:
-                return self._make_request(method, endpoint, params, use_cache, cache_ttl)
-            except BybitAPIError as e:
-                last_error = e
-                error_msg = str(e).lower()
-                
-                # Retry только для таймаутов
-                if ("timeout" in error_msg or "read timed out" in error_msg or "httpsconnectionpool" in error_msg) and attempt < max_retries:
-                    wait_time = (attempt + 1) * 2  # Экспоненциальная задержка: 2, 4, 6 секунд
-                    self.logger.warning(f"Таймаут API запроса (попытка {attempt + 1}/{max_retries + 1}). Повтор через {wait_time} сек...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    # Не retry для других ошибок или исчерпаны попытки
-                    raise e
-        
-        # Если все попытки исчерпаны
-        raise last_error
-    
-    def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None, 
-                          use_cache: bool = True, cache_ttl: int = 30) -> Dict[str, Any]:
-        """
-        Выполнение запроса к API с обработкой ошибок и кэшированием
-        """
-        if params is None:
-            params = {}
-        
-        # Проверяем кэш
-        cache_key = self._get_cache_key(f"{method}:{endpoint}", params)
-        if use_cache and self._is_cache_valid(cache_key, cache_ttl):
-            self.logger.debug(f"Возвращаем данные из кэша: {endpoint}")
-            return self.cache[cache_key]
-        
-        # Rate limiting
-        self.rate_limiter.acquire()
         
         try:
-            self.api_stats["total_requests"] += 1
-            self.api_stats["last_request_time"] = datetime.now()
-            
-            # Выполняем запрос через pybit
-            if method.upper() == "GET":
-                if endpoint == "get_orderbook":
-                    response = self.client.get_orderbook(**params)
-                elif endpoint == "get_kline":
-                    response = self.client.get_kline(**params)
-                elif endpoint == "get_tickers":
-                    response = self.client.get_tickers(**params)
-                elif endpoint == "get_instruments_info":
-                    response = self.client.get_instruments_info(**params)
-                elif endpoint == "get_wallet_balance":
-                    response = self.client.get_wallet_balance(**params)
-                elif endpoint == "get_account_info":
-                    # Используем правильный метод для получения информации об аккаунте
-                    response = self.client.get_account_info(**params)
-                elif endpoint == "get_positions":
-                    response = self.client.get_positions(**params)
-                elif endpoint == "get_open_orders":
-                    response = self.client.get_open_orders(**params)
-                elif endpoint == "get_order_history":
-                    response = self.client.get_order_history(**params)
-                elif endpoint == "get_executions":
-                    response = self.client.get_executions(**params)
-                else:
-                    raise BybitAPIError(f"Неподдерживаемый GET endpoint: {endpoint}")
-            
-            elif method.upper() == "POST":
-                if endpoint == "place_order":
-                    response = self.client.place_order(**params)
-                elif endpoint == "cancel_order":
-                    response = self.client.cancel_order(**params)
-                elif endpoint == "cancel_all_orders":
-                    response = self.client.cancel_all_orders(**params)
-                elif endpoint == "amend_order":
-                    response = self.client.amend_order(**params)
-                elif endpoint == "set_leverage":
-                    response = self.client.set_leverage(**params)
-                elif endpoint == "switch_margin_mode":
-                    response = self.client.switch_margin_mode(**params)
-                else:
-                    raise BybitAPIError(f"Неподдерживаемый POST endpoint: {endpoint}")
-            
+            if method.upper() == 'GET':
+                response = self.session.get(url, params=params, headers=headers, timeout=10)
+            elif method.upper() == 'POST':
+                request_body = body if body is not None else params
+                response = self.session.post(url, data=body_str if body_str else None, json=request_body if not body_str else None, headers=headers, timeout=10)
             else:
-                raise BybitAPIError(f"Неподдерживаемый HTTP метод: {method}")
+                raise ValueError(f"Неподдерживаемый HTTP метод: {method}")
             
-            # Проверяем ответ
-            if response.get("retCode") != 0:
-                error_msg = response.get("retMsg", "Неизвестная ошибка API")
+            response.raise_for_status()
+            data = response.json()
+            
+            # Проверка ответа API
+            if data.get('retCode') != 0:
+                error_msg = data.get('retMsg', 'Неизвестная ошибка API')
                 self.logger.error(f"API ошибка: {error_msg}")
-                self.api_stats["failed_requests"] += 1
-                
-                if "rate limit" in error_msg.lower():
-                    self.api_stats["rate_limit_hits"] += 1
-                    raise BybitRateLimitError(error_msg)
-                elif "auth" in error_msg.lower() or "signature" in error_msg.lower():
-                    raise BybitAuthError(error_msg)
-                else:
-                    raise BybitAPIError(error_msg)
+                raise Exception(f"API ошибка: {error_msg}")
             
-            self.api_stats["successful_requests"] += 1
+            return data.get('result', {})
             
-            # Сохраняем в кэш только GET запросы
-            if method.upper() == "GET" and use_cache:
-                self._set_cache(cache_key, response)
-            
-            # Логируем в БД
-            if self.db:
-                try:
-                    self.db.log_api_request(
-                        endpoint=endpoint,
-                        method=method,
-                        params=params,
-                        response_code=response.get("retCode", 0),
-                        success=True
-                    )
-                except Exception as e:
-                    self.logger.error(f"Ошибка логирования API запроса: {e}")
-            
-            return response
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Ошибка HTTP запроса: {e}")
+            raise Exception(f"Ошибка соединения с API: {e}")
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Ошибка парсинга JSON: {e}")
+            raise Exception(f"Некорректный ответ API: {e}")
+    
+    def _get_cached_data(self, cache_key: str) -> Optional[Dict]:
+        """Получение данных из кэша"""
+        if cache_key in self.cache:
+            data, timestamp = self.cache[cache_key]
+            if time.time() - timestamp < self.cache_timeout:
+                return data
+            else:
+                del self.cache[cache_key]
+        return None
+    
+    def _set_cached_data(self, cache_key: str, data: Dict):
+        """Сохранение данных в кэш"""
+        self.cache[cache_key] = (data, time.time())
+    
+    def get_wallet_balance(self, account_type: str = "UNIFIED", coin: str = None) -> Dict:
+        """Получение баланса кошелька для UNIFIED аккаунта
         
-        except (InvalidRequestError, FailedRequestError) as e:
-            error_msg = str(e).lower()
-            self.logger.error(f"Ошибка pybit: {e}")
-            self.api_stats["failed_requests"] += 1
-            
-            # Проверяем, является ли это таймаутом
-            if "timeout" in error_msg or "read timed out" in error_msg:
-                self.logger.warning(f"Таймаут API запроса к {endpoint}. Попробуйте позже.")
-                
-                # Логируем таймаут в БД
-                if self.db:
-                    try:
-                        self.db.log_api_request(
-                            endpoint=endpoint,
-                            method=method,
-                            params=params,
-                            response_code=-2,  # Специальный код для таймаута
-                            success=False,
-                            error_message=f"Таймаут: {str(e)}"
-                        )
-                    except Exception as db_e:
-                        self.logger.error(f"Ошибка логирования API таймаута: {db_e}")
-                
-                raise BybitAPIError(f"Таймаут соединения с API Bybit. Проверьте интернет-соединение и попробуйте позже.")
-            
-            # Логируем другие ошибки в БД
-            if self.db:
-                try:
-                    self.db.log_api_request(
-                        endpoint=endpoint,
-                        method=method,
-                        params=params,
-                        response_code=-1,
-                        success=False,
-                        error_message=str(e)
-                    )
-                except Exception as db_e:
-                    self.logger.error(f"Ошибка логирования API ошибки: {db_e}")
-            
-            raise BybitAPIError(f"Ошибка API: {e}")
+        Args:
+            account_type: Тип аккаунта (только UNIFIED поддерживается)
+            coin: Фильтр по монете (опционально)
+        """
+        # Отключаем кэширование для отладки
+        # cache_key = f"wallet_balance_{account_type}_{coin or 'all'}"
+        # cached_data = self._get_cached_data(cache_key)
+        # if cached_data:
+        #     return cached_data
         
+        self.logger.info(f"Запрос баланса кошелька: {account_type}, монета: {coin or 'все'}")
+        
+        try:
+            params = {'accountType': account_type}
+            if coin:
+                params['coin'] = coin
+                
+            result = self._make_request('GET', '/v5/account/wallet-balance', params)
+            
+            # self._set_cached_data(cache_key, result)
+            return result
         except Exception as e:
-            error_msg = str(e).lower()
-            self.logger.error(f"Неожиданная ошибка API: {e}")
-            self.api_stats["failed_requests"] += 1
+            self.logger.error(f"Ошибка получения баланса кошелька: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return {}
+    
+    def get_fund_balance(self, coin: str = None) -> Dict:
+        """Получение баланса FUND кошелька
+        
+        Args:
+            coin: Фильтр по монете (опционально)
+        """
+        cache_key = f"fund_balance_{coin or 'all'}"
+        cached_data = self._get_cached_data(cache_key)
+        if cached_data:
+            return cached_data
+        
+        params = {'accountType': 'FUND'}
+        if coin:
+            params['coin'] = coin
             
-            # Проверяем, является ли это таймаутом
-            if "timeout" in error_msg or "read timed out" in error_msg or "httpsconnectionpool" in error_msg:
-                self.logger.warning(f"Таймаут соединения с API Bybit: {e}")
-                raise BybitAPIError(f"Таймаут соединения с API Bybit. Проверьте интернет-соединение и попробуйте позже.")
+        result = self._make_request('GET', '/v5/asset/transfer/query-account-coins-balance', params)
+        
+        self._set_cached_data(cache_key, result)
+        return result
+    
+    def inter_transfer(self, coin: str, amount: str, from_account: str, to_account: str) -> Dict:
+        """Внутренний перевод между кошельками
+        
+        Args:
+            coin: Символ монеты (например, 'BTC', 'USDT')
+            amount: Сумма для перевода (строка)
+            from_account: Исходный кошелек (например, 'FUND')
+            to_account: Целевой кошелек (например, 'UNIFIED')
+        """
+        import uuid
+        transfer_id = str(uuid.uuid4())
+        
+        body = {
+            'transferId': transfer_id,
+            'coin': coin,
+            'amount': amount,
+            'fromAccountType': from_account,
+            'toAccountType': to_account
+        }
+        
+        return self._make_request('POST', '/v5/asset/transfer/inter-transfer', body=body)
+    
+    def get_transfer_coin_list(self, from_account: str = 'FUND', to_account: str = 'UNIFIED') -> Dict:
+        """Получение списка монет, доступных для перевода
+        
+        Args:
+            from_account: Исходный кошелек
+            to_account: Целевой кошелек
+        """
+        params = {
+            'fromAccountType': from_account,
+            'toAccountType': to_account
+        }
+        
+        return self._make_request('GET', '/v5/asset/transfer/query-transfer-coin-list', params)
+    
+    def get_positions(self, category: str = "linear", symbol: str = None, settle_coin: str = "USDT") -> List[Dict]:
+        """Получение позиций"""
+        # Отключаем кэширование для отладки
+        # cache_key = f"positions_{category}_{symbol or 'all'}_{settle_coin}"
+        # cached_data = self._get_cached_data(cache_key)
+        # if cached_data:
+        #     return cached_data
+        
+        params = {'category': category}
+        if symbol:
+            params['symbol'] = symbol
+        else:
+            # Если symbol не указан, используем settleCoin для получения всех позиций
+            if settle_coin:
+                params['settleCoin'] = settle_coin
+        
+        self.logger.info(f"Запрос позиций: {params}")
+        
+        try:
+            result = self._make_request('GET', '/v5/position/list', params)
+            positions = result.get('list', [])
             
-            raise BybitAPIError(f"Неожиданная ошибка: {e}")
+            self.logger.info(f"Получено позиций: {len(positions)}")
+            if not positions:
+                self.logger.warning(f"Нет позиций для {category} с параметрами {params}")
+            
+            # self._set_cached_data(cache_key, positions)
+            return positions
+        except Exception as e:
+            self.logger.error(f"Ошибка получения позиций: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return []
     
-    # Методы для получения рыночных данных
-    def get_orderbook(self, symbol: str, limit: int = 25) -> Dict[str, Any]:
+    def get_tickers(self, category: str = "linear", symbol: str = None) -> List[Dict]:
+        """Получение тикеров"""
+        cache_key = f"tickers_{category}_{symbol or 'all'}"
+        cached_data = self._get_cached_data(cache_key)
+        if cached_data:
+            return cached_data
+        
+        params = {'category': category}
+        if symbol:
+            params['symbol'] = symbol
+        
+        result = self._make_request('GET', '/v5/market/tickers', params)
+        tickers = result.get('list', [])
+        
+        self._set_cached_data(cache_key, tickers)
+        return tickers
+        
+    def _flatten_unified_balance(self, resp: dict) -> dict:
+        """UNIFIED → удобный словарь:
+           {
+             'total_wallet_usd': Decimal,
+             'total_available_usd': Decimal,
+             'coins': { 'USDT': Decimal, 'BTC': Decimal, ... }
+           }
         """
-        Получение стакана заявок
+        out = {'total_wallet_usd': Decimal('0'), 'total_available_usd': Decimal('0'), 'coins': {}}
+        try:
+            # Проверяем, что получили корректный ответ
+            if not resp or 'result' not in resp:
+                self.logger.warning("Получен пустой или некорректный ответ при запросе баланса")
+                return out
+                
+            # Проверяем, что есть список аккаунтов
+            if 'list' not in resp['result'] or not resp['result']['list']:
+                self.logger.warning(f"Нет данных о балансе в ответе API")
+                return out
+                
+            acc = resp['result']['list'][0]
+            out['total_wallet_usd'] = Decimal(str(acc.get('totalWalletBalance', '0')))
+            out['total_available_usd'] = Decimal(str(acc.get('totalAvailableBalance', '0')))
+            
+            # Логируем полный ответ для отладки
+            self.logger.info(f"Полный ответ баланса: {acc}")
+            
+            for c in acc.get('coin', []):
+                coin = c.get('coin')
+                # Используем walletBalance для получения точного количества монеты
+                bal = Decimal(str(c.get('walletBalance', '0')))
+                if coin:
+                    out['coins'][coin] = bal
+                    # Логируем каждую монету отдельно для отладки
+                    self.logger.info(f"Монета {coin}: walletBalance={bal}, usdValue={c.get('usdValue', '0')}")
+            
+            self.logger.info(f"Обработан баланс: {len(out['coins'])} монет, всего: {out['total_wallet_usd']} USD")
+            self.logger.info(f"Детальный баланс монет: {out['coins']}")
+        except Exception as e:
+            self.logger.error(f"Ошибка обработки баланса: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        return out
+
+    def _flatten_fund_balance(self, resp: dict) -> dict:
+        """FUND → {'coins': {'USDT': Decimal(...), 'BTC': Decimal(...), ...}}"""
+        out = {'coins': {}, 'accountType': 'FUND'}
+        try:
+            for c in resp['result'].get('balance', []):
+                coin = c.get('coin')
+                bal  = Decimal(str(c.get('walletBalance', '0')))
+                if coin:
+                    out['coins'][coin] = bal
+        except Exception:
+            pass
+        return out
+        
+    def get_unified_balance_flat(self, coins: list[str] = None) -> dict:
+        """Получение плоской структуры баланса UNIFIED кошелька"""
+        # Отключаем кэширование для отладки
+        self.logger.info("Запрос баланса UNIFIED кошелька")
+        try:
+            params = {'accountType': 'UNIFIED'}
+            if coins:
+                params['coin'] = ','.join(coins)
+            raw = self._make_request('GET', '/v5/account/wallet-balance', params)
+            flat_result = self._flatten_unified_balance(raw)
+            
+            self.logger.info(f"Получен баланс: {flat_result}")
+            return flat_result
+        except Exception as e:
+            self.logger.error(f"Ошибка получения баланса: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return {'total_wallet_usd': Decimal('0'), 'total_available_usd': Decimal('0'), 'coins': {}}
+
+    def get_fund_balance_flat(self, coins: list[str] = None) -> dict:
+        """Получение плоской структуры баланса FUND кошелька"""
+        params = {'accountType': 'FUND'}
+        if coins:
+            params['coin'] = ','.join(coins)
+        raw = self._make_request('GET', '/v5/asset/transfer/query-account-coins-balance', params)
+        return self._flatten_fund_balance(raw)
+
+    def usd_to_btc(self, usd: Decimal) -> Decimal:
+        """Конвертация USD в BTC по текущему курсу"""
+        tick = self._make_request('GET', '/v5/market/tickers', {'category': 'spot', 'symbol': 'BTCUSDT'})
+        try:
+            price = Decimal(str(tick['result']['list'][0]['lastPrice']))
+            return (usd / price) if price > 0 else Decimal('0')
+        except Exception:
+            return Decimal('0')
+    
+    def get_kline(self, category: str, symbol: str, interval: str, limit: int = 200, start: int = None, end: int = None) -> List[Dict]:
+        """Получение исторических данных (свечи)
+        
+        Args:
+            category: Категория (spot, linear и т.д.)
+            symbol: Символ тикера (например, BTCUSDT)
+            interval: Интервал (1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, W, M)
+            limit: Количество свечей (макс. 1000)
+            start: Начальное время в миллисекундах (UNIX timestamp)
+            end: Конечное время в миллисекундах (UNIX timestamp)
         """
         params = {
-            "category": "spot",
-            "symbol": symbol,
-            "limit": limit
+            'category': category,
+            'symbol': symbol,
+            'interval': interval,
+            'limit': limit
         }
-        return self._make_request_with_retry("GET", "get_orderbook", params)
+        
+        # Добавляем временной диапазон, если указан
+        if start is not None:
+            params['start'] = int(start)
+        if end is not None:
+            params['end'] = int(end)
+        
+        result = self._make_request('GET', '/v5/market/kline', params)
+        klines = result.get('list', [])
+        
+        # Преобразование в удобный формат
+        formatted_klines = []
+        for kline in klines:
+            formatted_klines.append({
+                'timestamp': int(kline[0]),
+                'open': float(kline[1]),
+                'high': float(kline[2]),
+                'low': float(kline[3]),
+                'close': float(kline[4]),
+                'volume': float(kline[5])
+            })
+        
+        return formatted_klines
     
-    def get_klines(self, symbol: str, interval: str, limit: int = 200, 
-                        start_time: Optional[int] = None, end_time: Optional[int] = None) -> Dict[str, Any]:
+    def get_klines(self, category: str, symbol: str, interval: str, limit: int = 200, start: int = None, end: int = None) -> Dict:
+        """Получение исторических данных (свечи) - обертка для совместимости
+        
+        Этот метод является оберткой для get_kline, возвращающей результат в формате,
+        ожидаемом в trading_bot_main.py
         """
-        Получение исторических данных (свечи)
-        """
+        try:
+            # Преобразуем интервалы из формата с буквой (1m, 5m, 15m) в числовой формат API (1, 5, 15)
+            interval_map = {
+                "1m": "1",
+                "5m": "5",
+                "15m": "15",
+                "30m": "30",
+                "1h": "60",
+                "4h": "240",
+                "1d": "D",
+                "1w": "W",
+                "1M": "M"
+            }
+            
+            api_interval = interval_map.get(interval, interval)
+            
+            # Получаем данные через базовый метод
+            klines = self._make_request('GET', '/v5/market/kline', {
+                'category': category,
+                'symbol': symbol,
+                'interval': api_interval,
+                'limit': limit,
+                **({"start": start} if start is not None else {}),
+                **({"end": end} if end is not None else {})
+            })
+            
+            return klines
+        except Exception as e:
+            self.logger.error(f"API ошибка: {str(e)}")
+            raise Exception(f"API ошибка: {str(e)}")
+    
+    def place_order(self, category: str, symbol: str, side: str, order_type: str, 
+                   qty: str, price: str = None, **kwargs) -> Dict:
+        """Размещение ордера"""
         params = {
-            "category": "spot",
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        }
-        
-        if start_time:
-            params["start"] = start_time
-        if end_time:
-            params["end"] = end_time
-        
-        return self._make_request_with_retry("GET", "get_kline", params)
-    
-    def get_tickers(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Получение тикеров
-        """
-        params = {"category": "spot"}
-        if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request_with_retry("GET", "get_tickers", params)
-    
-    def get_instruments_info(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Получение информации об инструментах
-        """
-        params = {"category": "spot"}
-        if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request_with_retry("GET", "get_instruments_info", params)
-    
-    # Методы для работы с аккаунтом
-    def get_wallet_balance(self, account_type: str = "UNIFIED") -> Dict[str, Any]:
-        """
-        Получение баланса кошелька
-        """
-        params = {"accountType": account_type}
-        return self._make_request_with_retry("GET", "get_wallet_balance", params, use_cache=False)
-    
-    def get_positions(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Получение позиций
-        """
-        params = {"category": "linear"}
-        if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request_with_retry("GET", "get_positions", params, use_cache=False)
-    
-    def get_open_orders(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Получение открытых ордеров
-        """
-        params = {"category": "spot"}
-        if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request_with_retry("GET", "get_open_orders", params, use_cache=False)
-    
-    def get_order_history(self, symbol: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
-        """
-        Получение истории ордеров
-        """
-        params = {
-            "category": "spot",
-            "limit": limit
-        }
-        if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request_with_retry("GET", "get_order_history", params, use_cache=False)
-    
-    def get_executions(self, symbol: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
-        """
-        Получение истории исполнений
-        """
-        params = {
-            "category": "spot",
-            "limit": limit
-        }
-        if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request_with_retry("GET", "get_executions", params, use_cache=False)
-    
-    # Торговые методы
-    def place_order(self, symbol: str, side: str, order_type: str, qty: str, 
-                         price: Optional[str] = None, time_in_force: str = "GTC", 
-                         **kwargs) -> Dict[str, Any]:
-        """
-        Размещение ордера
-        """
-        params = {
-            "category": "spot",
-            "symbol": symbol,
-            "side": side,
-            "orderType": order_type,
-            "qty": qty,
-            "timeInForce": time_in_force
+            'category': category,
+            'symbol': symbol,
+            'side': side,
+            'orderType': order_type,
+            'qty': qty
         }
         
         if price:
-            params["price"] = price
+            params['price'] = price
         
-        # Добавляем дополнительные параметры
+        # Дополнительные параметры
         params.update(kwargs)
         
-        return self._make_request_with_retry("POST", "place_order", params, use_cache=False)
+        result = self._make_request('POST', '/v5/order/create', params)
+        return result
     
-    def cancel_order(self, symbol: str, order_id: Optional[str] = None, 
-                          order_link_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Отмена ордера
-        """
+    def cancel_order(self, category: str, symbol: str, order_id: str = None, 
+                    order_link_id: str = None) -> Dict:
+        """Отмена ордера"""
         params = {
-            "category": "spot",
-            "symbol": symbol
+            'category': category,
+            'symbol': symbol
         }
         
         if order_id:
-            params["orderId"] = order_id
+            params['orderId'] = order_id
         elif order_link_id:
-            params["orderLinkId"] = order_link_id
+            params['orderLinkId'] = order_link_id
         else:
             raise ValueError("Необходимо указать order_id или order_link_id")
         
-        return self._make_request_with_retry("POST", "cancel_order", params, use_cache=False)
+        result = self._make_request('POST', '/v5/order/cancel', params)
+        return result
     
-    def cancel_all_orders(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Отмена всех ордеров
-        """
-        params = {"category": "spot"}
+    def get_order_history(self, category: str, symbol: str = None, limit: int = 50) -> List[Dict]:
+        """Получение истории ордеров"""
+        params = {
+            'category': category,
+            'limit': limit
+        }
+        
         if symbol:
-            params["symbol"] = symbol
+            params['symbol'] = symbol
         
-        return self._make_request_with_retry("POST", "cancel_all_orders", params, use_cache=False)
+        result = self._make_request('GET', '/v5/order/history', params)
+        return result.get('list', [])
     
-    def amend_order(self, symbol: str, order_id: Optional[str] = None, 
-                         order_link_id: Optional[str] = None, qty: Optional[str] = None, 
-                         price: Optional[str] = None) -> Dict[str, Any]:
+    def get_open_orders(self, category: str = "spot", symbol: str = None, limit: int = 50) -> Dict:
+        """Получение открытых ордеров
+        
+        Args:
+            category: Категория (spot, linear, inverse)
+            symbol: Символ торговой пары (опционально)
+            limit: Количество записей (макс. 50)
+            
+        Returns:
+            Dict: Информация об открытых ордерах
         """
-        Изменение ордера
-        """
+        params = {'category': category, 'limit': limit}
+        
+        if symbol:
+            params['symbol'] = symbol
+        
+        return self._make_request('GET', '/v5/order/realtime', params)
+    
+    def get_execution_list(self, category: str, symbol: str = None, limit: int = 50) -> List[Dict]:
+        """Получение истории исполнений"""
         params = {
-            "category": "spot",
-            "symbol": symbol
+            'category': category,
+            'limit': limit
         }
         
-        if order_id:
-            params["orderId"] = order_id
-        elif order_link_id:
-            params["orderLinkId"] = order_link_id
-        else:
-            raise ValueError("Необходимо указать order_id или order_link_id")
+        if symbol:
+            params['symbol'] = symbol
         
-        if qty:
-            params["qty"] = qty
-        if price:
-            params["price"] = price
-        
-        return self._make_request_with_retry("POST", "amend_order", params, use_cache=False)
-    
-    # Методы для работы с позициями (деривативы)
-    def set_leverage(self, symbol: str, buy_leverage: str, sell_leverage: str) -> Dict[str, Any]:
-        """
-        Установка плеча
-        """
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "buyLeverage": buy_leverage,
-            "sellLeverage": sell_leverage
-        }
-        
-        return self._make_request_with_retry("POST", "set_leverage", params, use_cache=False)
-    
-    def switch_margin_mode(self, symbol: str, trade_mode: int, 
-                                buy_leverage: str, sell_leverage: str) -> Dict[str, Any]:
-        """
-        Переключение режима маржи
-        """
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "tradeMode": trade_mode,
-            "buyLeverage": buy_leverage,
-            "sellLeverage": sell_leverage
-        }
-        
-        return self._make_request_with_retry("POST", "switch_margin_mode", params, use_cache=False)
-    
-    # Методы для работы с аккаунтом (дубликат - удаляем)
-    def get_wallet_balance_v2(self, account_type: str = "UNIFIED") -> Dict[str, Any]:
-        """
-        Получение баланса кошелька (версия 2)
-        """
-        params = {
-            "accountType": account_type
-        }
-        
-        return self._make_request_with_retry("GET", "get_wallet_balance", params, use_cache=True, cache_ttl=30)
-    
-    def get_account_info(self) -> Dict[str, Any]:
-        """
-        Получение информации об аккаунте
-        """
-        try:
-            return self._make_request_with_retry("GET", "get_account_info", {}, use_cache=True, cache_ttl=60)
-        except Exception as e:
-            self.logger.warning(f"Ошибка получения информации об аккаунте: {e}")
-            # Возвращаем базовую информацию
-            return {
-                "retCode": 0,
-                "retMsg": "OK", 
-                "result": {
-                    "marginMode": "REGULAR_MARGIN",
-                    "unifiedMarginStatus": 1,
-                    "isMasterTrader": False,
-                    "spotHedgingStatus": "OFF",
-                    "updatedTime": str(int(datetime.now().timestamp() * 1000))
-                }
-            }
-    
-    def get_rate_limit_status(self) -> Dict[str, Any]:
-        """
-        Получение статуса rate limit
-        """
-        return {
-            "requests_made": self.rate_limiter.requests_made,
-            "max_requests": self.rate_limiter.max_requests,
-            "time_window": self.rate_limiter.time_window,
-            "remaining_requests": max(0, self.rate_limiter.max_requests - self.rate_limiter.requests_made),
-            "reset_time": self.rate_limiter.window_start + self.rate_limiter.time_window
-        }
-    
-    # Утилиты
-    def get_api_stats(self) -> Dict[str, Any]:
-        """
-        Получение статистики API
-        """
-        return self.api_stats.copy()
-    
-    def clear_cache(self):
-        """
-        Очистка кэша
-        """
-        self.cache.clear()
-        self.cache_ttl.clear()
-        self.logger.info("Кэш API очищен")
+        result = self._make_request('GET', '/v5/execution/list', params)
+        return result.get('list', [])
     
     def test_connection(self) -> bool:
-        """
-        Тест соединения с API
-        """
+        """Тест соединения с API"""
         try:
-            response = self.get_tickers("BTCUSDT")
-            return response.get("retCode") == 0
+            # Простой запрос для проверки соединения
+            self._make_request('GET', '/v5/market/time')
+            return True
         except Exception as e:
-            self.logger.error(f"Ошибка тестирования соединения: {e}")
+            self.logger.error(f"Ошибка соединения: {e}")
             return False
     
-    def __del__(self):
-        """
-        Деструктор
-        """
-        if hasattr(self, 'logger'):
-            self.logger.info("Bybit клиент завершает работу")
+    def get_server_time(self) -> int:
+        """Получение времени сервера"""
+        result = self._make_request('GET', '/v5/market/time')
+        return int(result.get('timeSecond', 0))
+    
+    def get_instruments_info(self, category: str, symbol: str = None) -> List[Dict]:
+        """Получение информации об инструментах"""
+        params = {'category': category}
+        if symbol:
+            params['symbol'] = symbol
+        
+        result = self._make_request('GET', '/v5/market/instruments-info', params)
+        return result.get('list', [])
