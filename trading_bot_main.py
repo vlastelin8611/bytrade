@@ -29,8 +29,8 @@ from src.utils.log_handler import setup_terminal_logging
 sys.path.append(str(Path(__file__).parent / 'src'))
 
 # Импорт компонентов для работы со стратегиями
-from bytrade.src.gui.tabs.strategies_tab import StrategiesTab
-from bytrade.src.strategies.strategy_engine import StrategyEngine
+from src.gui.strategies_tab import StrategiesTab
+from src.strategy.strategy_engine import StrategyEngine
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
@@ -84,6 +84,11 @@ class TradingWorker(QThread):
         self.ml_strategy = None
         self.db_manager = None
         self.config_manager = None
+        
+        # Инициализация атрибутов для работы с балансом и историей сделок
+        self.trade_history = []
+        self.balance_limit_active = False
+        self.balance_limit_amount = 0.0
         
         # Статистика торговли
         self.daily_volume = 0.0
@@ -173,6 +178,12 @@ class TradingWorker(QThread):
                     db_manager=self.db_manager,
                     config_manager=self.config_manager
                 )
+                
+                # Создаем и устанавливаем ticker_loader для ML-стратегии
+                from src.tools.ticker_data_loader import TickerDataLoader
+                self.ticker_loader = TickerDataLoader()
+                self.ml_strategy.ticker_loader = self.ticker_loader
+                
                 self.log_message.emit("✅ Объект ML стратегии создан")
                 ml_init_time = (time.time() - start_time) * 1000
                 
@@ -651,7 +662,13 @@ class TradingWorker(QThread):
             
             # ML анализ с обработкой ошибок
             try:
-                analysis = self.ml_strategy.analyze_market(symbol, klines)
+                # Формируем словарь данных для анализа
+                market_data = {
+                    'symbol': symbol,
+                    'klines': klines,
+                    'current_price': float(klines[-1]['close']) if klines and len(klines) > 0 else 0.0
+                }
+                analysis = self.ml_strategy.analyze_market(market_data)
             except Exception as ml_error:
                 self.logger.error(f"Ошибка ML анализа для {symbol}: {ml_error}")
                 return None
@@ -733,15 +750,19 @@ class TradingWorker(QThread):
                 return None
             
             # Расчет размера позиции
-            balance = self.bybit_client.get_wallet_balance()
-            if not balance:
+            balance_resp = self.bybit_client.get_wallet_balance()
+            if not balance_resp:
                 return None
             
-            available_balance = float(balance.get('availableBalance', 0))
+            # Правильное получение доступного баланса из вложенной структуры
+            available_balance = 0.0
+            if balance_resp and 'result' in balance_resp and balance_resp['result'].get('list'):
+                available_balance = float(balance_resp['result']['list'][0].get('totalAvailableBalance', 0))
             
             # Если активен ограничитель баланса, используем его вместо полного баланса
-            if self.balance_limit_active and self.balance_limit_amount > 0:
-                available_balance = min(available_balance, self.balance_limit_amount)
+            if hasattr(self, 'balance_limit_active') and hasattr(self, 'balance_limit_amount'):
+                if self.balance_limit_active and self.balance_limit_amount > 0:
+                    available_balance = min(available_balance, self.balance_limit_amount)
             
             # Размер позиции зависит от уверенности (1-3% от баланса)
             position_percentage = 0.01 + (confidence - 0.65) * 0.02  # 1-3%
@@ -755,7 +776,9 @@ class TradingWorker(QThread):
             # Размещение ордера
             side = 'Buy' if signal == 'BUY' else 'Sell'
             
+            # Добавляем обязательный параметр category='spot'
             order_result = self.bybit_client.place_order(
+                category='spot',  # Обязательный параметр для API Bybit v5
                 symbol=symbol,
                 side=side,
                 order_type='Market',
@@ -777,11 +800,14 @@ class TradingWorker(QThread):
                     'status': 'Executed'
                 }
                 
-                # Добавляем сделку в историю торговли
-                self.trade_history.append(trade_info)
-                
-                # Обновляем статистику торговли
-                self.update_trading_stats()
+                # Проверяем наличие атрибута trade_history перед использованием
+                if hasattr(self, 'trade_history'):
+                    # Добавляем сделку в историю торговли
+                    self.trade_history.append(trade_info)
+                    
+                    # Обновляем статистику торговли
+                    if hasattr(self, 'update_trading_stats'):
+                        self.update_trading_stats()
                 
                 # Логирование торговой операции
                 try:
@@ -796,25 +822,37 @@ class TradingWorker(QThread):
                 
                 return trade_info
             else:
-                pass
-                # self.db_manager.log_entry({
-                #     'level': 'WARNING',
-                #     'logger_name': 'TRADING_ORDER',
-                #     'message': f'Order failed: {symbol} {side}',
-                #     'session_id': session_id
-                # }) # Временно закомментировано - блокирует выполнение
+                error_msg = f"Не удалось разместить ордер: {symbol} {side}"
+                self.logger.warning(error_msg)
+                self.log_message.emit(f"⚠️ {error_msg}")
+                
+                try:
+                    if self.db_manager:
+                        self.db_manager.log_entry({
+                            'level': 'WARNING',
+                            'logger_name': 'TRADING_ORDER',
+                            'message': f'Order failed: {symbol} {side}',
+                            'session_id': session_id
+                        })
+                except Exception as db_error:
+                    self.logger.error(f"Ошибка записи в лог БД: {db_error}")
             
         except Exception as e:
             error_msg = f"Ошибка выполнения торговой операции {symbol}: {e}"
             self.logger.error(error_msg)
+            self.log_message.emit(f"❌ {error_msg}")
             
-            # self.db_manager.log_entry({
-            #     'level': 'ERROR',
-            #     'logger_name': 'TRADING_EXECUTION',
-            #     'message': error_msg,
-            #     'exception': e,
-            #     'session_id': getattr(self, 'current_session_id', None)
-            # }) # Временно закомментировано - блокирует выполнение
+            try:
+                if self.db_manager:
+                    self.db_manager.log_entry({
+                        'level': 'ERROR',
+                        'logger_name': 'TRADING_EXECUTION',
+                        'message': error_msg,
+                        'exception': str(e),
+                        'session_id': getattr(self, 'current_session_id', None)
+                    })
+            except Exception as db_error:
+                self.logger.error(f"Ошибка записи в лог БД: {db_error}")
             
             return None
     
@@ -3859,7 +3897,24 @@ class TradingBotMainWindow(QMainWindow):
         
         try:
             # Получаем данные для графика с указанием категории 'spot'
-            response = self.bybit_client.get_klines(category='spot', symbol=symbol, interval=interval, limit=100)
+            try:
+                response = self.bybit_client.get_klines(category='spot', symbol=symbol, interval=interval, limit=100)
+            except Exception as kline_error:
+                if "Invalid period" in str(kline_error):
+                    self.logger.warning(f"Символ {symbol}: ошибка периода, пробуем альтернативный интервал")
+                    # Преобразуем интервал в поддерживаемый формат
+                    interval_map_fallback = {
+                        "1h": "60",
+                        "4h": "240",
+                        "1d": "D",
+                        "1w": "W",
+                        "1M": "M"
+                    }
+                    fallback_interval = interval_map_fallback.get(interval, "15")
+                    self.add_log_message(f"ℹ️ Используем альтернативный интервал: {fallback_interval}")
+                    response = self.bybit_client.get_klines(category='spot', symbol=symbol, interval=fallback_interval, limit=100)
+                else:
+                    raise kline_error
             
             # Извлекаем список свечей из структуры ответа API
             if 'result' in response and 'list' in response['result']:
