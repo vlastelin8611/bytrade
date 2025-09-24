@@ -492,8 +492,43 @@ class BybitClient:
             
             return klines
         except Exception as e:
-            self.logger.error(f"API ошибка: {str(e)}")
-            raise Exception(f"API ошибка: {str(e)}")
+            error_msg = str(e)
+            # Если ошибка связана с неподдерживаемым интервалом, пробуем альтернативные
+            if "Invalid period" in error_msg or "invalid interval" in error_msg.lower():
+                self.logger.warning(f"Интервал {interval} не поддерживается для {symbol}, пробуем альтернативные")
+                
+                # Список альтернативных интервалов в порядке приоритета
+                alternative_intervals = []
+                if interval == "1h" or api_interval == "60":
+                    alternative_intervals = ["15", "30", "240"]  # 15m, 30m, 4h
+                elif interval == "4h" or api_interval == "240":
+                    alternative_intervals = ["60", "D"]  # 1h, 1d
+                elif interval == "1d" or api_interval == "D":
+                    alternative_intervals = ["240", "W"]  # 4h, 1w
+                
+                # Пробуем альтернативные интервалы
+                for alt_interval in alternative_intervals:
+                    try:
+                        self.logger.info(f"Пробуем интервал {alt_interval} для {symbol}")
+                        klines = self._make_request('GET', '/v5/market/kline', {
+                            'category': category,
+                            'symbol': symbol,
+                            'interval': alt_interval,
+                            'limit': limit,
+                            **({"start": start} if start is not None else {}),
+                            **({"end": end} if end is not None else {})
+                        })
+                        self.logger.info(f"Успешно получены данные с интервалом {alt_interval} для {symbol}")
+                        return klines
+                    except Exception as alt_error:
+                        self.logger.debug(f"Альтернативный интервал {alt_interval} также не работает: {alt_error}")
+                        continue
+                
+                # Если все альтернативы не сработали
+                self.logger.error(f"Не удалось получить данные для {symbol} ни с одним интервалом")
+            
+            self.logger.error(f"API ошибка: {error_msg}")
+            raise Exception(f"API ошибка: {error_msg}")
     
     def place_order(self, category: str, symbol: str, side: str, order_type: str, 
                    qty: str, price: str = None, **kwargs) -> Dict:

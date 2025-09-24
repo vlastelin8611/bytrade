@@ -179,10 +179,12 @@ class TradingWorker(QThread):
                     config_manager=self.config_manager
                 )
                 
-                # Создаем и устанавливаем ticker_loader для ML-стратегии
+                # Интеграция TickerDataLoader для загрузки исторических данных
+                self.log_message.emit("🔧 Создание TickerDataLoader...")
                 from src.tools.ticker_data_loader import TickerDataLoader
-                self.ticker_loader = TickerDataLoader()
-                self.ml_strategy.ticker_loader = self.ticker_loader
+                ticker_loader = TickerDataLoader()
+                self.ml_strategy.ticker_loader = ticker_loader
+                self.log_message.emit("✅ TickerDataLoader интегрирован с ML стратегией")
                 
                 self.log_message.emit("✅ Объект ML стратегии создан")
                 ml_init_time = (time.time() - start_time) * 1000

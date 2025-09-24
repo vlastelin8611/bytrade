@@ -34,7 +34,7 @@ USE_TESTNET = True  # True - тестовая сеть, False - реальная
 
 # Лимиты торговли
 MAX_DAILY_VOLUME_PERCENT = 0.20  # Максимум 20% от баланса в день
-MIN_CONFIDENCE_THRESHOLD = 0.65  # Минимальная уверенность для торговли (65%)
+MIN_CONFIDENCE_THRESHOLD = 0.35  # Минимальная уверенность для торговли (35% - временно снижено для тестирования)
 MAX_POSITION_PERCENT = 0.03  # Максимум 3% от баланса на одну позицию
 MIN_POSITION_SIZE = 10.0  # Минимальный размер позиции в USD
 

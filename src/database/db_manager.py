@@ -556,6 +556,28 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"Ошибка логирования снимка аккаунта: {e}")
     
+    def log_analysis(self, analysis_log: Dict):
+        """Логирование результатов ML-анализа"""
+        try:
+            details_json = {
+                'symbol': analysis_log.get('symbol'),
+                'current_price': analysis_log.get('current_price'),
+                'features': analysis_log.get('features'),
+                'regime': analysis_log.get('regime'),
+                'prediction': analysis_log.get('prediction')
+            }
+
+            self.log_system_action(
+                level='INFO',
+                component='ML_ANALYSIS',
+                action=f"Analysis for {analysis_log.get('symbol', 'unknown')}",
+                details=details_json,
+                execution_time_ms=None,
+                session_id=None
+            )
+        except Exception as e:
+            self.logger.error(f"Ошибка логирования анализа: {e}")
+
     def log_entry(self, entry: Dict[str, Any]):
         """Универсальный метод логирования с поддержкой нового формата"""
         try:

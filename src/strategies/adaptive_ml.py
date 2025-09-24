@@ -231,10 +231,119 @@ class AdaptiveMLStrategy:
                 return self.load_historical_data_from_ticker_loader(symbol, timeframe, limit)
             else:
                 self.logger.warning("ticker_loader не доступен, используем стандартный метод загрузки")
-                # Здесь можно добавить стандартный метод загрузки через API
-                return False
+                return self.load_historical_data_from_api(symbol, timeframe, limit)
         except Exception as e:
             self.logger.error(f"Ошибка при подготовке исторических данных: {e}")
+            return False
+    
+    def load_historical_data_from_ticker_loader(self, symbol: str, timeframe: str, limit: int = 500):
+        """Загрузка исторических данных из ticker_loader"""
+        try:
+            if not hasattr(self, 'ticker_loader') or not self.ticker_loader:
+                return False
+                
+            # Получаем данные из ticker_loader
+            data = self.ticker_loader.get_ticker_data(symbol)
+            if not data or 'klines' not in data:
+                self.logger.warning(f"Нет данных в ticker_loader для {symbol}")
+                return False
+                
+            klines = data['klines'][-limit:] if len(data['klines']) > limit else data['klines']
+            
+            if len(klines) < self.feature_window:
+                self.logger.warning(f"Недостаточно данных для {symbol}: {len(klines)} < {self.feature_window}")
+                return False
+                
+            # Обучаем модель на исторических данных
+            return self.train_on_historical_data(symbol, klines)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка загрузки из ticker_loader для {symbol}: {e}")
+            return False
+    
+    def load_historical_data_from_api(self, symbol: str, timeframe: str, limit: int = 500):
+        """Загрузка исторических данных напрямую через API"""
+        try:
+            if not self.api_client:
+                return False
+                
+            # Получаем исторические данные через API
+            result = self.api_client.get_klines(
+                category='spot',
+                symbol=symbol,
+                interval=timeframe,
+                limit=limit
+            )
+            
+            if not result or 'list' not in result:
+                self.logger.warning(f"API не вернул данные для {symbol}")
+                return False
+                
+            klines = result['list']
+            if len(klines) < self.feature_window:
+                self.logger.warning(f"Недостаточно данных от API для {symbol}: {len(klines)} < {self.feature_window}")
+                return False
+                
+            # Преобразуем формат данных API в стандартный формат
+            formatted_klines = []
+            for kline in klines:
+                formatted_klines.append({
+                    'open': float(kline[1]),
+                    'high': float(kline[2]),
+                    'low': float(kline[3]),
+                    'close': float(kline[4]),
+                    'volume': float(kline[5]),
+                    'timestamp': int(kline[0])
+                })
+                
+            # Обучаем модель на исторических данных
+            return self.train_on_historical_data(symbol, formatted_klines)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка загрузки через API для {symbol}: {e}")
+            return False
+    
+    def train_on_historical_data(self, symbol: str, klines: List[Dict]):
+        """Обучение модели на исторических данных"""
+        try:
+            if not SKLEARN_AVAILABLE or len(klines) < self.feature_window + 10:
+                return False
+                
+            features = []
+            labels = []
+            
+            # Извлекаем признаки и создаем метки
+            for i in range(self.feature_window, len(klines) - 1):
+                window = klines[i - self.feature_window : i]
+                feat = self.extract_features(window)
+                if feat:
+                    features.append(feat)
+                    
+                    # Создаем метку на основе изменения цены
+                    current_price = float(klines[i]['close'])
+                    future_price = float(klines[i + 1]['close'])
+                    change = (future_price - current_price) / current_price
+                    
+                    # Метки: 1 (BUY), -1 (SELL), 0 (HOLD)
+                    if change > 0.002:  # рост > 0.2%
+                        label = 1
+                    elif change < -0.002:  # падение > 0.2%
+                        label = -1
+                    else:
+                        label = 0
+                    labels.append(label)
+            
+            if len(features) < 50:  # Минимум данных для обучения
+                self.logger.warning(f"Недостаточно признаков для обучения {symbol}: {len(features)}")
+                return False
+                
+            # Обучаем модель
+            self.train_model(symbol, features, labels)
+            self.logger.info(f"✅ Модель обучена для {symbol} на {len(features)} примерах")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка обучения на исторических данных для {symbol}: {e}")
             return False
             
     def analyze_market(self, market_data: Dict) -> Dict[str, Any]:
