@@ -9,6 +9,7 @@ import logging
 import datetime
 from pathlib import Path
 
+
 logger = logging.getLogger(__name__)
 
 class TickerDataLoader:
@@ -34,6 +35,10 @@ class TickerDataLoader:
         self.tickers_data = {}
         self.historical_data = {}
         self.last_update_timestamp = None
+
+    def get_data_file_path(self) -> Path:
+        """Возвращает путь к файлу с сохранёнными данными тикеров."""
+        return self.data_path / 'tickers_data.json'
     
     def load_tickers_data(self):
         """
@@ -44,7 +49,7 @@ class TickerDataLoader:
                   или None в случае ошибки
         """
         try:
-            data_file = self.data_path / 'tickers_data.json'
+            data_file = self.get_data_file_path()
             
             if not data_file.exists():
                 logger.warning(f"Файл с данными тикеров не найден: {data_file}")

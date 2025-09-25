@@ -257,12 +257,20 @@ class TrainingMonitor(QMainWindow):
         super().__init__()
         self.setWindowTitle("ML Training Monitor - Визуализация обучения нейросети")
         self.setGeometry(100, 100, 1200, 800)
-        
+
+        # Атрибуты состояния обучения
+        self.training_in_progress = False
+        self.pending_training = False
+        self.symbol_progress = {}
+        self.expected_symbol_count = 0
+        self.last_ticker_file_mtime = None
+        self.ticker_data_file = None
+
         # Инициализация компонентов
         self.init_ml_components()
         self.init_ui()
         self.setup_timers()
-        
+
         # Загружаем список символов
         self.load_symbols()
 
@@ -283,6 +291,9 @@ class TrainingMonitor(QMainWindow):
             try:
                 from src.tools.ticker_data_loader import TickerDataLoader
                 self.ticker_loader = TickerDataLoader()
+                self.ticker_data_file = self.ticker_loader.get_data_file_path()
+                if self.ticker_data_file.exists():
+                    self.last_ticker_file_mtime = self.ticker_data_file.stat().st_mtime
             except Exception as e:
                 print(f"Ошибка инициализации TickerDataLoader: {e}")
                 self.ticker_loader = None
@@ -481,12 +492,89 @@ class TrainingMonitor(QMainWindow):
         self.metrics_timer.timeout.connect(self.update_metrics)
         self.metrics_timer.start(5000)  # Обновление каждые 5 секунд
 
+        # Таймер для отслеживания обновлений данных тикеров
+        self.ticker_data_timer = QTimer()
+        self.ticker_data_timer.timeout.connect(self.check_ticker_data_updates)
+        self.ticker_data_timer.start(2000)
+
+    def check_ticker_data_updates(self):
+        """Отслеживает появление новых данных тикеров и запускает автообучение."""
+        if not self.ticker_loader:
+            return
+
+        try:
+            data_file = self.ticker_data_file or self.ticker_loader.get_data_file_path()
+            if not data_file.exists():
+                return
+
+            mtime = data_file.stat().st_mtime
+            if self.last_ticker_file_mtime is None or mtime > self.last_ticker_file_mtime:
+                self.last_ticker_file_mtime = mtime
+                self.log("📥 Обнаружено обновление данных тикеров. Запускаем автоматическое обучение.")
+                self.handle_new_ticker_data()
+        except Exception as e:
+            self.log(f"⚠️ Ошибка отслеживания данных тикеров: {e}")
+
+    def handle_new_ticker_data(self):
+        """Загружает свежие тикеры и запускает обучение при необходимости."""
+        try:
+            if self.ticker_loader:
+                self.ticker_loader.load_tickers_data()
+
+            self.load_symbols()
+
+            if not self.symbols:
+                self.log("⚠️ Список символов пуст. Автообучение не запущено.")
+                return
+
+            if self.training_in_progress:
+                self.pending_training = True
+                self.log("⏳ Обучение уже выполняется. Перезапуск запланирован после завершения текущей сессии.")
+            else:
+                self.start_training(auto=True)
+        except Exception as e:
+            self.log(f"❌ Ошибка автообучения по новым данным: {e}")
+
+    def extract_symbols_from_ticker_data(self, ticker_data) -> List[str]:
+        """Извлекает список символов из сохранённых данных тикеров."""
+        symbols = []
+        suspicious_symbols = []
+
+        if isinstance(ticker_data, dict):
+            iterable = ticker_data.items()
+        elif isinstance(ticker_data, list):
+            iterable = ((entry.get('symbol'), entry) for entry in ticker_data if isinstance(entry, dict))
+        else:
+            return symbols
+
+        seen = set()
+        for symbol, payload in iterable:
+            if not symbol or symbol in seen:
+                continue
+
+            seen.add(symbol)
+            symbols.append(symbol)
+
+            try:
+                price = float(payload.get('lastPrice') or payload.get('last_price') or 0)
+                volume = float(payload.get('volume') or payload.get('volume24h') or 0)
+                if price <= 0 or volume < 0:
+                    suspicious_symbols.append(symbol)
+            except (TypeError, ValueError):
+                suspicious_symbols.append(symbol)
+
+        if suspicious_symbols:
+            preview = ', '.join(suspicious_symbols[:10])
+            self.log(f"⚠️ Обнаружены подозрительные значения в данных тикеров: {preview}")
+
+        return symbols
+
     def validate_symbols_with_api(self, symbols: List[str]) -> List[str]:
         """Валидация символов через API Bybit
-        
+
         Args:
             symbols: Список символов для валидации
-            
+
         Returns:
             List[str]: Список поддерживаемых символов с информацией о категории
         """
@@ -496,8 +584,8 @@ class TrainingMonitor(QMainWindow):
             # Получаем поддерживаемые инструменты для разных категорий
             categories = ['spot', 'linear']
             supported_symbols = {}
-            symbol_categories = {}  # Сохраняем информацию о категориях для каждого символа
-            
+            symbol_categories = {}
+
             for category in categories:
                 try:
                     instruments = self.ml_strategy.api_client.get_instruments_info(category=category)
@@ -513,37 +601,44 @@ class TrainingMonitor(QMainWindow):
                                 category_symbols.add(symbol)
                                 
                                 # Сохраняем информацию о категории
+                                supported_symbols.setdefault(category, set()).add(symbol)
+
                                 if symbol not in symbol_categories:
                                     symbol_categories[symbol] = []
                                 symbol_categories[symbol].append(category)
-                        
-                        supported_symbols[category] = category_symbols
-                        self.log(f"✅ Категория '{category}': {len(category_symbols)} активных USDT инструментов")
+
+                        if category not in supported_symbols:
+                            supported_symbols[category] = set()
+                        self.log(f"✅ Категория '{category}': {len(supported_symbols[category])} активных USDT инструментов")
                     else:
                         supported_symbols[category] = set()
                         self.log(f"❌ Не удалось получить инструменты для категории '{category}'")
                 except Exception as e:
                     supported_symbols[category] = set()
                     self.log(f"❌ Ошибка при получении инструментов для категории '{category}': {e}")
-            
-            # Фильтруем символы, оставляя только поддерживаемые
-            valid_symbols = []
+
+            api_confirmed = set()
+            for category_symbols in supported_symbols.values():
+                api_confirmed.update(category_symbols)
+
+            missing_confirmation = [symbol for symbol in symbols if symbol not in api_confirmed]
+
+            # Сохраняем информацию о категориях; для неподтверждённых символов используем значение по умолчанию
             for symbol in symbols:
-                found_categories = []
-                
-                for category, category_symbols in supported_symbols.items():
-                    if symbol in category_symbols:
-                        found_categories.append(category)
-                
-                if found_categories:
-                    valid_symbols.append(symbol)
-            
-            # Сохраняем информацию о категориях для использования в обучении
+                if symbol not in symbol_categories:
+                    symbol_categories[symbol] = ['spot']
+
             self.symbol_categories = symbol_categories
-            
-            self.log(f"✅ Валидировано {len(valid_symbols)} из {len(symbols)} символов")
-            return valid_symbols
-            
+
+            confirmed_count = len(symbols) - len(missing_confirmation)
+            self.log(f"✅ Проверено символов: {len(symbols)}. Подтверждено API: {confirmed_count}")
+
+            if missing_confirmation:
+                preview = ', '.join(missing_confirmation[:10])
+                self.log(f"⚠️ API не подтвердил {len(missing_confirmation)} символов. Используем данные тикеров: {preview}")
+
+            return symbols
+
         except Exception as e:
             self.log(f"❌ Ошибка валидации символов: {e}")
             return symbols  # Возвращаем исходный список в случае ошибки
@@ -556,20 +651,28 @@ class TrainingMonitor(QMainWindow):
                 ticker_data = self.ticker_loader.get_ticker_data()
                 if ticker_data:
                     # Получаем все символы из загруженных данных
-                    all_symbols = list(ticker_data.keys()) if isinstance(ticker_data, dict) else []
+                    all_symbols = self.extract_symbols_from_ticker_data(ticker_data)
                     # Фильтруем только USDT пары
                     usdt_symbols = [symbol for symbol in all_symbols if symbol.endswith('USDT')]
-                    self.log(f"📊 Загружено символов из TickerDataLoader: {len(usdt_symbols)}")
-                    
-                    # Валидируем символы через API
-                    validated_symbols = self.validate_symbols_with_api(usdt_symbols)
-                    
-                    if validated_symbols:
+                    unique_symbols = sorted(set(usdt_symbols))
+                    self.expected_symbol_count = len(unique_symbols)
+                    self.log(f"📊 Загружено символов из программы тикеров: {self.expected_symbol_count}")
+
+                    if unique_symbols:
+                        # Валидируем символы через API (категории сохраняются для обучения)
+                        validated_symbols = self.validate_symbols_with_api(unique_symbols)
+
                         self.symbols = validated_symbols
-                        self.log(f"✅ Валидировано символов для обучения: {len(validated_symbols)}")
+                        self.log(
+                            f"✅ Символы для обучения обновлены: {len(self.symbols)} (ожидается по тикерам: {self.expected_symbol_count})"
+                        )
+
+                        if hasattr(self, 'symbols_text'):
+                            self.symbols_text.setPlainText('\n'.join(self.symbols))
+
                         return
                     else:
-                        self.log("⚠️ Не найдено валидных символов из TickerDataLoader")
+                        self.log("⚠️ В данных тикеров не найдено USDT-символов")
                 else:
                     self.log("⚠️ Не удалось загрузить символы из TickerDataLoader")
             
@@ -607,11 +710,31 @@ class TrainingMonitor(QMainWindow):
             self.symbols = ['BTCUSDT', 'ETHUSDT']
             self.symbol_categories = {symbol: ['spot'] for symbol in self.symbols}
 
-    def start_training(self):
+    def start_training(self, auto=False):
         """Запуск обучения"""
         try:
+            if self.training_in_progress:
+                if not auto:
+                    self.log("⚠️ Обучение уже выполняется")
+                return
+
+            if auto:
+                self.log("🤖 Автоматический запуск обучения на свежих данных")
+            else:
+                self.log("🚀 Запуск обучения моделей")
+
+            self.training_in_progress = True
+            self.pending_training = False
+
             self.load_symbols()
-            
+
+            if not self.symbols:
+                self.log("⚠️ Нет символов для обучения")
+                self.training_in_progress = False
+                self.pending_training = False
+                self.status_label.setText("⚠️ Нет символов для обучения")
+                return
+
             # Обновляем таблицу прогресса
             self.progress_table.setRowCount(len(self.symbols))
             for i, symbol in enumerate(self.symbols):
@@ -619,25 +742,31 @@ class TrainingMonitor(QMainWindow):
                 self.progress_table.setItem(i, 1, QTableWidgetItem("0%"))
                 self.progress_table.setItem(i, 2, QTableWidgetItem("Ожидание"))
                 self.progress_table.setItem(i, 3, QTableWidgetItem("-"))
-            
+
+            self.symbol_progress = {symbol: 0 for symbol in self.symbols}
+            self.overall_progress.setValue(0)
+
             # Создаем и запускаем поток обучения
             self.training_worker = TrainingWorker(
-                self.ml_strategy, 
-                self.symbols, 
+                self.ml_strategy,
+                self.symbols,
                 getattr(self, 'symbol_categories', {})
             )
             self.training_worker.progress_updated.connect(self.update_progress)
             self.training_worker.status_updated.connect(self.update_status)
             self.training_worker.log_updated.connect(self.log)
             self.training_worker.training_completed.connect(self.training_finished)
-            
+
             self.training_worker.start()
-            
+
             # Обновляем UI
             self.train_button.setEnabled(False)
             self.stop_button.setEnabled(True)
-            self.status_label.setText("🚀 Обучение запущено...")
-            
+            if auto:
+                self.status_label.setText("🤖 Автоматическое обучение запущено...")
+            else:
+                self.status_label.setText("🚀 Обучение запущено...")
+
         except Exception as e:
             self.log(f"Ошибка запуска обучения: {e}")
 
@@ -651,8 +780,29 @@ class TrainingMonitor(QMainWindow):
         """Завершение обучения"""
         self.train_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.status_label.setText("✅ Обучение завершено")
-        self.overall_progress.setValue(100)
+        self.training_in_progress = False
+
+        overall = 0
+        if self.symbol_progress:
+            overall = sum(self.symbol_progress.values()) / len(self.symbol_progress)
+            self.overall_progress.setValue(int(overall))
+        else:
+            self.overall_progress.setValue(0)
+
+        if overall >= 99.9:
+            self.status_label.setText("✅ Обучение завершено")
+            self.log("✅ Обучение завершено")
+        else:
+            self.status_label.setText("⏹️ Обучение остановлено")
+            self.log("⏹️ Обучение остановлено до завершения")
+
+        if hasattr(self, 'training_worker'):
+            self.training_worker = None
+
+        if self.pending_training:
+            self.log("🔁 Запускаем отложенное обучение после завершения текущей сессии")
+            self.pending_training = False
+            QTimer.singleShot(1000, lambda: self.start_training(auto=True))
 
     def update_progress(self, symbol: str, progress: int):
         """Обновление прогресса для символа"""
@@ -660,6 +810,13 @@ class TrainingMonitor(QMainWindow):
             if self.progress_table.item(row, 0).text() == symbol:
                 self.progress_table.setItem(row, 1, QTableWidgetItem(f"{progress}%"))
                 break
+
+        if symbol in self.symbol_progress:
+            self.symbol_progress[symbol] = progress
+            total_symbols = len(self.symbol_progress)
+            if total_symbols:
+                overall = sum(self.symbol_progress.values()) / total_symbols
+                self.overall_progress.setValue(int(overall))
 
     def update_status(self, symbol: str, status: str, accuracy: float):
         """Обновление статуса для символа"""

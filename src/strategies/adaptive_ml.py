@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 import pickle
 import json
+import time
 
 try:
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -734,21 +735,30 @@ class AdaptiveMLStrategy:
             # Оценка качества
             y_pred = model.predict(X_test_scaled)
             accuracy = accuracy_score(y_test, y_pred)
-            
+
+            report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+            precision = report.get('weighted avg', {}).get('precision', 0.0)
+            recall = report.get('weighted avg', {}).get('recall', 0.0)
+            f1_score = report.get('weighted avg', {}).get('f1-score', 0.0)
+
             # Сохранение модели и скейлера
             self.models[symbol] = model
             self.scalers[symbol] = scaler
             self.model_performance[symbol] = accuracy
-            
+
             # Обновляем атрибут performance для GUI
             self.performance[symbol] = {
                 'accuracy': accuracy,
-                'samples': len(features)
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1_score,
+                'samples': len(features),
+                'last_trained': time.time()
             }
-            
+
             self.logger.info(f"Модель для {symbol} обучена с точностью: {accuracy:.3f}")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Ошибка обучения модели для {symbol}: {e}")
             return False
@@ -760,7 +770,10 @@ class AdaptiveMLStrategy:
             models_file = self.model_path / f"{self.name}_models.pkl"
             scalers_file = self.model_path / f"{self.name}_scalers.pkl"
             performance_file = self.model_path / f"{self.name}_performance.json"
-            self.logger.info(f"📁 Проверка файлов: {models_file.name}, {scalers_file.name}, {performance_file.name}")
+            training_state_file = self.model_path / f"{self.name}_training_state.json"
+            self.logger.info(
+                f"📁 Проверка файлов: {models_file.name}, {scalers_file.name}, {performance_file.name}, {training_state_file.name}"
+            )
 
             if models_file.exists():
                 self.logger.info("📊 Загрузка моделей...")
@@ -784,29 +797,61 @@ class AdaptiveMLStrategy:
             else:
                 self.logger.info("❌ Файл статистики не найден")
 
+            if training_state_file.exists():
+                self.logger.info("📈 Загрузка состояния обучения моделей...")
+                with open(training_state_file, 'r') as f:
+                    stored_state = json.load(f)
+
+                if isinstance(stored_state, dict):
+                    self.performance = stored_state
+                    for symbol, metrics in stored_state.items():
+                        if isinstance(metrics, dict):
+                            accuracy = metrics.get('accuracy')
+                            if accuracy is not None:
+                                self.model_performance[symbol] = accuracy
+                else:
+                    self.logger.warning("Некорректный формат файла состояния обучения")
+            else:
+                # Обеспечиваем обратную совместимость
+                self.performance = {
+                    symbol: {
+                        'accuracy': accuracy,
+                        'precision': 0.0,
+                        'recall': 0.0,
+                        'f1_score': 0.0,
+                        'samples': 0,
+                        'last_trained': None
+                    }
+                    for symbol, accuracy in self.model_performance.items()
+                }
+
             self.logger.info("✅ Загрузка моделей завершена")
 
         except Exception as e:
             self.logger.error(f"Ошибка загрузки моделей: {e}")
-    
+
     def save_models(self):
         """Сохранение моделей"""
         try:
             models_file = self.model_path / f"{self.name}_models.pkl"
             scalers_file = self.model_path / f"{self.name}_scalers.pkl"
             performance_file = self.model_path / f"{self.name}_performance.json"
-            
+            training_state_file = self.model_path / f"{self.name}_training_state.json"
+
             with open(models_file, 'wb') as f:
                 pickle.dump(self.models, f)
-            
+
             with open(scalers_file, 'wb') as f:
                 pickle.dump(self.scalers, f)
-            
+
             with open(performance_file, 'w') as f:
                 json.dump(self.model_performance, f)
-            
+
+            with open(training_state_file, 'w') as f:
+                json.dump(self.performance, f)
+
             self.logger.info("Модели сохранены")
-            
+
         except Exception as e:
             self.logger.error(f"Ошибка сохранения моделей: {e}")
     
