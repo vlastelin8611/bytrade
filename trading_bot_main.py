@@ -18,6 +18,7 @@ from pathlib import Path
 import threading
 import time
 import inspect
+import math
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -40,7 +41,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QGridLayout, QSpacerItem, QSizePolicy,
     QLineEdit, QComboBox, QSlider
 )
-from PySide6.QtCore import QTimer, QThread, Signal, Qt, QMutex, QMetaObject, Q_ARG
+from PySide6.QtCore import QTimer, QThread, Signal, Qt, QMutex, QMetaObject, Q_ARG, Slot
 from PySide6.QtGui import QTextCursor
 from PySide6.QtGui import QFont, QPalette, QColor, QPixmap, QIcon
 
@@ -738,24 +739,38 @@ class TradingWorker(QThread):
             self.logger.error(f"Ошибка проверки лимитов: {e}")
             return False
     
-    def _execute_trade(self, symbol: str, analysis: dict, session_id: str) -> Optional[dict]:
+    def _execute_trade(self, symbol: str, analysis: dict, session_id: str, force: bool = False) -> Optional[dict]:
         """Выполнение торговой операции"""
         try:
             start_time = time.time()
-            
+
+            if not analysis:
+                self.logger.warning(f"Пустой анализ для {symbol}, торговая операция пропущена")
+                return None
+
             signal = analysis.get('signal')
+            if signal not in {'BUY', 'SELL'}:
+                self.logger.info(f"Некорректный сигнал {signal} для {symbol}, операция пропущена")
+                return None
+
             confidence = analysis.get('confidence', 0)
-            
+
+            if not self.bybit_client:
+                self.logger.error("API клиент не инициализирован, торговая операция невозможна")
+                self.log_message.emit("❌ API клиент не готов, операция отменена")
+                return None
+
             # Проверка, включена ли торговля
-            if not self.trading_enabled:
+            if not self.trading_enabled and not force:
                 self.logger.info(f"Торговля отключена. Сигнал {signal} для {symbol} игнорируется.")
                 return None
-            
+
             # Расчет размера позиции
             balance_resp = self.bybit_client.get_wallet_balance()
             if not balance_resp:
+                self.logger.warning("Не удалось получить баланс кошелька, операция отменена")
                 return None
-            
+
             # Правильное получение доступного баланса из вложенной структуры
             available_balance = 0.0
             if balance_resp:
@@ -778,22 +793,62 @@ class TradingWorker(QThread):
             # Размер позиции зависит от уверенности (1-3% от баланса)
             position_percentage = 0.01 + (confidence - 0.65) * 0.02  # 1-3%
             position_size = available_balance * position_percentage
-            
+
             # Проверка минимального размера
             if position_size < 10:
                 self.logger.info(f"Размер позиции слишком мал: ${position_size:.2f} < $10.00")
                 return None
-            
+
+            # Получаем последнюю цену, чтобы перевести сумму в количество базовой валюты
+            last_price = None
+            try:
+                if hasattr(self.ml_strategy, 'ticker_loader') and self.ml_strategy.ticker_loader:
+                    cached_ticker = self.ml_strategy.ticker_loader.get_ticker_data(symbol)
+                    if isinstance(cached_ticker, dict):
+                        for key in ('lastPrice', 'last_price', 'price'):
+                            value = cached_ticker.get(key)
+                            if value is not None:
+                                last_price = float(value)
+                                break
+                if (not last_price or last_price <= 0) and self.bybit_client:
+                    ticker_snapshot = self.bybit_client.get_tickers(category='spot', symbol=symbol)
+                    if ticker_snapshot:
+                        price_candidate = ticker_snapshot[0].get('lastPrice') or ticker_snapshot[0].get('lastPrice24h')
+                        if price_candidate is not None:
+                            last_price = float(price_candidate)
+            except Exception as price_error:
+                self.logger.error(f"Не удалось получить цену для {symbol}: {price_error}")
+                last_price = None
+
+            if not last_price or last_price <= 0:
+                self.logger.warning(f"Не удалось определить цену для {symbol}, торговля пропущена")
+                return None
+
+            trade_qty = position_size / last_price
+            if trade_qty <= 0:
+                self.logger.warning(f"Расчитанное количество для {symbol} некорректно: {trade_qty}")
+                return None
+
+            # Небольшое округление количества, чтобы соответствовать допустимым шагам биржи
+            trade_qty = max(trade_qty, 0)
+            qty_str = f"{trade_qty:.6f}".rstrip('0').rstrip('.')
+            if not qty_str:
+                qty_str = "0.000001"
+
+            self.logger.info(
+                f"Формируем ордер для {symbol}: сумма ${position_size:.2f}, цена {last_price:.6f}, количество {qty_str}"
+            )
+
             # Размещение ордера
             side = 'Buy' if signal == 'BUY' else 'Sell'
-            
+
             # Добавляем обязательный параметр category='spot'
             order_result = self.bybit_client.place_order(
                 category='spot',  # Обязательный параметр для API Bybit v5
                 symbol=symbol,
                 side=side,
                 order_type='Market',
-                qty=str(position_size)
+                qty=qty_str
             )
             
             exec_time = (time.time() - start_time) * 1000
@@ -852,7 +907,7 @@ class TradingWorker(QThread):
             error_msg = f"Ошибка выполнения торговой операции {symbol}: {e}"
             self.logger.error(error_msg)
             self.log_message.emit(f"❌ {error_msg}")
-            
+
             try:
                 if self.db_manager:
                     self.db_manager.log_entry({
@@ -864,9 +919,42 @@ class TradingWorker(QThread):
                     })
             except Exception as db_error:
                 self.logger.error(f"Ошибка записи в лог БД: {db_error}")
-            
+
             return None
-    
+
+    @Slot(str, dict, str)
+    def handle_manual_trade(self, symbol: str, analysis: dict, session_id: str) -> None:
+        """Обработка ручных сделок из основного UI потока."""
+        self._mutex.lock()
+        try:
+            if not self.running:
+                self.log_message.emit("⚠️ Торговый поток ещё не запущен, ручная сделка отклонена")
+                return
+
+            if not analysis or analysis.get('signal') not in {'BUY', 'SELL'}:
+                self.log_message.emit("⚠️ Некорректный сигнал для ручной сделки")
+                return
+
+            self.logger.info(f"Получен запрос на ручную сделку: {analysis.get('signal')} {symbol}")
+
+            result = self._execute_trade(symbol, analysis, session_id, force=True)
+
+            if result:
+                self.daily_volume += float(result.get('size', 0))
+                self.trade_executed.emit(result)
+                self.log_message.emit(
+                    f"✅ Ручная сделка выполнена: {symbol} {analysis.get('signal')} на сумму ${float(result.get('size', 0)):.2f}"
+                )
+            else:
+                self.log_message.emit(f"⚠️ Ручная сделка не выполнена для {symbol}")
+
+        except Exception as e:
+            error_msg = f"Ошибка обработки ручной сделки {symbol}: {e}"
+            self.logger.error(error_msg)
+            self.log_message.emit(f"❌ {error_msg}")
+        finally:
+            self._mutex.unlock()
+
     def enable_trading(self, enabled: bool):
         """Включение/выключение торговли"""
         self._mutex.lock()
@@ -911,9 +999,10 @@ class TradingWorker(QThread):
 
 class TradingBotMainWindow(QMainWindow):
     """Главное окно приложения торгового бота"""
-    
+
     # Сигналы для обновления UI из других потоков
     balance_limit_timer_signal = Signal(int)  # Сигнал для обновления таймера ограничителя баланса
+    manual_trade_requested = Signal(str, dict, str)
     
     def __init__(self):
         super().__init__()
@@ -1979,6 +2068,7 @@ class TradingBotMainWindow(QMainWindow):
             self.trading_worker.log_message.connect(self.add_log_message)
             self.trading_worker.error_occurred.connect(self.handle_error)
             self.trading_worker.status_updated.connect(self.update_connection_status)
+            self.manual_trade_requested.connect(self.trading_worker.handle_manual_trade)
             print("✅ Сигналы подключены")
             
             # Запуск потока
@@ -4073,35 +4163,41 @@ class TradingBotMainWindow(QMainWindow):
             if not hasattr(self, 'tickers_data') or not self.tickers_data:
                 self.add_log_message("❌ Нет данных по тикерам для покупки")
                 return
-            
-            # Находим самый дешевый тикер
-            lowest_symbol = min(
-                self.tickers_data.items(), 
-                key=lambda x: float(x[1].get('lastPrice', float('inf')))
-            )[0]
-            
+
+            price_candidates = []
+            for symbol, info in self.tickers_data.items():
+                try:
+                    price = float(info.get('lastPrice', 0))
+                except (TypeError, ValueError):
+                    continue
+
+                if not math.isfinite(price) or price <= 0:
+                    continue
+
+                price_candidates.append((symbol, price))
+
+            if not price_candidates:
+                self.add_log_message("⚠️ Не удалось определить цены тикеров для покупки")
+                return
+
+            lowest_symbol, lowest_price = min(price_candidates, key=lambda item: item[1])
+
             self.add_log_message(f"🔍 Выбран самый дешевый тикер: {lowest_symbol}")
-            
+
             # Проверяем наличие торгового воркера
-            if not hasattr(self, 'trading_worker') or self.trading_worker is None:
+            trading_worker = getattr(self, 'trading_worker', None)
+            if not trading_worker or not trading_worker.isRunning():
                 self.add_log_message("❌ Торговый воркер не инициализирован")
                 return
-            
+
             # Создаем анализ для ручной покупки
-            analysis = {'signal': 'BUY', 'confidence': 1.0}
-            
-            # Временно включаем торговлю для выполнения ручной сделки
-            original_trading_state = getattr(self.trading_worker, 'trading_enabled', False)
-            self.trading_worker.trading_enabled = True
-            
-            # Выполняем сделку
-            self.trading_worker._execute_trade(lowest_symbol, analysis, session_id="manual_buy")
-            
-            # Восстанавливаем исходное состояние торговли
-            self.trading_worker.trading_enabled = original_trading_state
-            
-            self.add_log_message(f"💰 Отправлен ордер на покупку {lowest_symbol}")
-            
+            analysis = {'signal': 'BUY', 'confidence': 1.0, 'origin': 'manual'}
+
+            # Отправляем запрос в торговый поток асинхронно
+            self.manual_trade_requested.emit(lowest_symbol, analysis, "manual_buy")
+
+            self.add_log_message(f"⏳ Запрос на покупку {lowest_symbol} отправлен в торговый поток (цена ${lowest_price:.6f})")
+
         except Exception as e:
             self.add_log_message(f"❌ Ошибка при покупке: {str(e)}")
             self.logger.error(f"Ошибка в buy_lowest_ticker: {e}")
@@ -4123,7 +4219,10 @@ class TradingBotMainWindow(QMainWindow):
             # Фильтруем монеты с положительным балансом (исключаем стейблкоины)
             non_stable_coins = []
             for coin in coins:
-                usd_value = float(coin.get('usdValue', 0))
+                try:
+                    usd_value = float(coin.get('usdValue', 0))
+                except (TypeError, ValueError):
+                    continue
                 coin_name = coin.get('coin', '')
                 # Исключаем стейблкоины и монеты с нулевым балансом
                 if usd_value > 1.0 and coin_name not in ['USDT', 'USDC', 'BUSD', 'DAI']:
@@ -4135,29 +4234,24 @@ class TradingBotMainWindow(QMainWindow):
             
             # Находим актив с минимальной USD стоимостью
             lowest_coin = min(non_stable_coins, key=lambda c: float(c.get('usdValue', 0)))
+            lowest_value = float(lowest_coin.get('usdValue', 0))
             symbol = lowest_coin['coin'] + "USDT"
-            
-            self.add_log_message(f"🔍 Выбран актив для продажи: {symbol} (${lowest_coin.get('usdValue', 0)})")
-            
+
+            self.add_log_message(f"🔍 Выбран актив для продажи: {symbol} (${lowest_value:.2f})")
+
             # Проверяем наличие торгового воркера
-            if not hasattr(self, 'trading_worker') or self.trading_worker is None:
+            trading_worker = getattr(self, 'trading_worker', None)
+            if not trading_worker or not trading_worker.isRunning():
                 self.add_log_message("❌ Торговый воркер не инициализирован")
                 return
-            
+
             # Создаем анализ для ручной продажи
-            analysis = {'signal': 'SELL', 'confidence': 1.0}
-            
-            # Временно включаем торговлю для выполнения ручной сделки
-            original_trading_state = getattr(self.trading_worker, 'trading_enabled', False)
-            self.trading_worker.trading_enabled = True
-            
-            # Выполняем сделку
-            self.trading_worker._execute_trade(symbol, analysis, session_id="manual_sell")
-            
-            # Восстанавливаем исходное состояние торговли
-            self.trading_worker.trading_enabled = original_trading_state
-            
-            self.add_log_message(f"💸 Отправлен ордер на продажу {symbol}")
+            analysis = {'signal': 'SELL', 'confidence': 1.0, 'origin': 'manual'}
+
+            # Отправляем запрос в торговый поток асинхронно
+            self.manual_trade_requested.emit(symbol, analysis, "manual_sell")
+
+            self.add_log_message(f"⏳ Запрос на продажу {symbol} отправлен в торговый поток")
             
         except Exception as e:
             self.add_log_message(f"❌ Ошибка при продаже: {str(e)}")
