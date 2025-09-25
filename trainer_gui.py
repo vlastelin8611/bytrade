@@ -676,6 +676,10 @@ class TrainingMonitor(QMainWindow):
                 except Exception as loader_error:
                     self.log(f"⚠️ Не удалось обновить данные тикеров: {loader_error}")
 
+                ticker_data = self.ticker_loader.get_ticker_data()
+                if not ticker_data:
+                    self.log("ℹ️ Не удалось получить свежие данные тикеров из памяти, используем кэш")
+
                 unique_symbols, usdt_symbols = self._collect_symbols_from_cache()
                 self.expected_symbol_count = len(unique_symbols)
 
@@ -688,7 +692,7 @@ class TrainingMonitor(QMainWindow):
                 if not unique_symbols:
                     self.log("⚠️ В данных тикеров не найдено символов для обучения")
                 else:
-                    if not usdt_symbols:
+                    if ticker_data and not usdt_symbols:
                         self.log("⚠️ В данных тикеров не найдено USDT-символов")
 
                     # Валидируем символы через API (категории сохраняются для обучения)
