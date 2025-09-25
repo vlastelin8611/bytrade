@@ -9,7 +9,7 @@ import os
 import json
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -642,6 +642,29 @@ class TrainingMonitor(QMainWindow):
             self.log(f"❌ Ошибка валидации символов: {e}")
             return symbols  # Возвращаем исходный список в случае ошибки
 
+    def _collect_symbols_from_cache(self) -> Tuple[List[str], List[str]]:
+        """Возвращает полный список символов и подмножество USDT-символов из кеша тикеров."""
+        raw_symbols = set()
+
+        ticker_snapshot = self.ticker_loader.get_ticker_data()
+        if ticker_snapshot:
+            raw_symbols.update(self.extract_symbols_from_ticker_data(ticker_snapshot))
+
+        historical_snapshot = self.ticker_loader.get_historical_data()
+        if isinstance(historical_snapshot, dict):
+            raw_symbols.update(
+                symbol for symbol in historical_snapshot.keys() if isinstance(symbol, str) and symbol
+            )
+        elif isinstance(historical_snapshot, list):
+            for entry in historical_snapshot:
+                symbol = entry.get('symbol') if isinstance(entry, dict) else None
+                if isinstance(symbol, str) and symbol:
+                    raw_symbols.add(symbol)
+
+        unique_symbols = sorted(symbol for symbol in raw_symbols if isinstance(symbol, str) and symbol.strip())
+        usdt_symbols = [symbol for symbol in unique_symbols if symbol.endswith('USDT')]
+        return unique_symbols, usdt_symbols
+
     def load_symbols(self):
         """Загрузка списка символов с валидацией через API"""
         try:
@@ -653,31 +676,21 @@ class TrainingMonitor(QMainWindow):
                 except Exception as loader_error:
                     self.log(f"⚠️ Не удалось обновить данные тикеров: {loader_error}")
 
-                raw_symbols = set()
-
-                ticker_snapshot = self.ticker_loader.get_ticker_data()
-                if ticker_snapshot:
-                    raw_symbols.update(self.extract_symbols_from_ticker_data(ticker_snapshot))
-
-                historical_snapshot = self.ticker_loader.get_historical_data()
-                if isinstance(historical_snapshot, dict):
-                    raw_symbols.update(symbol for symbol in historical_snapshot.keys() if isinstance(symbol, str) and symbol)
-                elif isinstance(historical_snapshot, list):
-                    for entry in historical_snapshot:
-                        symbol = entry.get('symbol') if isinstance(entry, dict) else None
-                        if isinstance(symbol, str) and symbol:
-                            raw_symbols.add(symbol)
-
-                unique_symbols = sorted(symbol for symbol in raw_symbols if isinstance(symbol, str) and symbol.strip())
+                unique_symbols, usdt_symbols = self._collect_symbols_from_cache()
                 self.expected_symbol_count = len(unique_symbols)
 
-                usdt_count = sum(1 for symbol in unique_symbols if symbol.endswith('USDT'))
+                usdt_count = len(usdt_symbols)
                 other_count = self.expected_symbol_count - usdt_count
                 self.log(
                     f"📊 Загружено символов из программы тикеров: {self.expected_symbol_count} (USDT: {usdt_count}, другие котировки: {other_count})"
                 )
 
-                if unique_symbols:
+                if not unique_symbols:
+                    self.log("⚠️ В данных тикеров не найдено символов для обучения")
+                else:
+                    if not usdt_symbols:
+                        self.log("⚠️ В данных тикеров не найдено USDT-символов")
+
                     # Валидируем символы через API (категории сохраняются для обучения)
                     validated_symbols = self.validate_symbols_with_api(unique_symbols)
 
@@ -690,8 +703,6 @@ class TrainingMonitor(QMainWindow):
                         self.symbols_text.setPlainText('\n'.join(self.symbols))
 
                     return
-                else:
-                    self.log("⚠️ В данных тикеров не найдено символов для обучения")
             else:
                 self.log("⚠️ Не удалось загрузить символы из TickerDataLoader")
             
