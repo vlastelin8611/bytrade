@@ -677,13 +677,22 @@ class TrainingMonitor(QMainWindow):
                     self.log(f"⚠️ Не удалось обновить данные тикеров: {loader_error}")
 
                 ticker_data = self.ticker_loader.get_ticker_data()
-                if not ticker_data:
+                if ticker_data:
+                    all_symbols = self.extract_symbols_from_ticker_data(ticker_data)
+                    live_usdt_symbols = sorted({symbol for symbol in all_symbols if symbol.endswith('USDT')})
+                else:
                     self.log("ℹ️ Не удалось получить свежие данные тикеров из памяти, используем кэш")
+                    live_usdt_symbols = []
 
-                unique_symbols, usdt_symbols = self._collect_symbols_from_cache()
+                unique_symbols, cached_usdt_symbols = self._collect_symbols_from_cache()
+                if not unique_symbols and live_usdt_symbols:
+                    # Если кеш пуст, используем USDT-символы из свежих данных
+                    unique_symbols = live_usdt_symbols
+                    cached_usdt_symbols = live_usdt_symbols
+
                 self.expected_symbol_count = len(unique_symbols)
 
-                usdt_count = len(usdt_symbols)
+                usdt_count = len(cached_usdt_symbols)
                 other_count = self.expected_symbol_count - usdt_count
                 self.log(
                     f"📊 Загружено символов из программы тикеров: {self.expected_symbol_count} (USDT: {usdt_count}, другие котировки: {other_count})"
@@ -692,7 +701,7 @@ class TrainingMonitor(QMainWindow):
                 if not unique_symbols:
                     self.log("⚠️ В данных тикеров не найдено символов для обучения")
                 else:
-                    if ticker_data and not usdt_symbols:
+                    if ticker_data and not live_usdt_symbols:
                         self.log("⚠️ В данных тикеров не найдено USDT-символов")
 
                     # Валидируем символы через API (категории сохраняются для обучения)
