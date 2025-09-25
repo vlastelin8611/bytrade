@@ -670,6 +670,26 @@ class BybitClient:
         params = {'category': category}
         if symbol:
             params['symbol'] = symbol
-        
-        result = self._make_request('GET', '/v5/market/instruments-info', params)
-        return result.get('list', [])
+
+        aggregated: List[Dict] = []
+        next_cursor: Optional[str] = None
+        has_symbol_filter = symbol is not None
+
+        while True:
+            query_params = params.copy()
+            if next_cursor:
+                query_params['cursor'] = next_cursor
+
+            result = self._make_request('GET', '/v5/market/instruments-info', query_params)
+            instruments = result.get('list', []) or []
+            aggregated.extend(instruments)
+
+            next_cursor = result.get('nextPageCursor')
+
+            if has_symbol_filter or not next_cursor:
+                break
+
+            if not instruments:
+                break
+
+        return aggregated
