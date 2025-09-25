@@ -155,7 +155,7 @@ def test_ticker_strategy_integration():
         
         # Параметры для теста
         symbol = "BTCUSDT"
-        timeframe = "1h"
+        timeframe = "4h"
         limit = 100
         
         # Загрузка данных через ticker_loader

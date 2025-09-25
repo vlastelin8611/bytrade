@@ -364,17 +364,17 @@ class TradingWorker(QThread):
                     # и без усечения до меньших значений
                     coin_name = coin.get('coin')
                     wallet_balance = coin.get('walletBalance', '0')
-                    available_balance = coin.get('availableToWithdraw', '0')
+                    # Для UNIFIED аккаунтов используем walletBalance вместо availableToWithdraw
+                    available_balance = coin.get('availableToWithdraw', wallet_balance)
+                    if not available_balance or available_balance == '':
+                        available_balance = wallet_balance
                     usd_value = coin.get('usdValue', '0')
                     
                     # Суммируем USD стоимость для общего баланса
                     try:
                         total_wallet_usd += float(usd_value)
-                        # Рассчитываем доступный баланс в USD пропорционально
-                        if float(wallet_balance) > 0:
-                            available_ratio = float(available_balance) / float(wallet_balance)
-                            available_usd = float(usd_value) * available_ratio
-                            total_available_usd += available_usd
+                        # Для UNIFIED аккаунтов используем walletBalance как доступный баланс
+                        total_available_usd += float(usd_value)
                     except (ValueError, TypeError, ZeroDivisionError):
                         self.logger.warning(f"Ошибка расчета USD для {coin_name}")
                     
@@ -637,7 +637,7 @@ class TradingWorker(QThread):
                 klines = self.bybit_client.get_kline(
                     category='spot',
                     symbol=symbol,
-                    interval='1h',
+                    interval='4h',
                     limit=200
                 )
             except Exception as kline_error:
@@ -681,7 +681,7 @@ class TradingWorker(QThread):
             if analysis:
                 analysis_data = {
                     'symbol': symbol,
-                    'timeframe': '1h',
+                    'timeframe': '4h',
                     'current_price': klines[-1].get('close') if klines else 0,
                     'features': analysis.get('features', []),
                     'indicators': analysis.get('indicators', {}),
@@ -758,8 +758,17 @@ class TradingWorker(QThread):
             
             # Правильное получение доступного баланса из вложенной структуры
             available_balance = 0.0
-            if balance_resp and 'result' in balance_resp and balance_resp['result'].get('list'):
-                available_balance = float(balance_resp['result']['list'][0].get('totalAvailableBalance', 0))
+            if balance_resp:
+                # Проверяем оба формата ответа: с 'result' и без него
+                if 'result' in balance_resp and balance_resp['result'].get('list'):
+                    # Формат с 'result': {'result': {'list': [...]}}
+                    available_balance = float(balance_resp['result']['list'][0].get('totalAvailableBalance', 0))
+                elif 'list' in balance_resp and balance_resp['list']:
+                    # Формат без 'result': {'list': [...]}
+                    available_balance = float(balance_resp['list'][0].get('totalAvailableBalance', 0))
+                else:
+                    self.logger.warning(f"Неожиданный формат ответа баланса: {balance_resp}")
+                    available_balance = 0.0
             
             # Если активен ограничитель баланса, используем его вместо полного баланса
             if hasattr(self, 'balance_limit_active') and hasattr(self, 'balance_limit_amount'):
@@ -1447,8 +1456,51 @@ class TradingBotMainWindow(QMainWindow):
         main_buttons_layout.addWidget(self.refresh_btn)
         main_buttons_layout.addStretch()
         
-        # Добавляем только основные кнопки управления
+        # Вторая строка - кнопки ручной торговли
+        manual_trading_layout = QHBoxLayout()
+        
+        self.buy_lowest_btn = QPushButton("💰 Купить самый дешёвый")
+        self.buy_lowest_btn.setStyleSheet(
+            "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:hover { background-color: #229954; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.buy_lowest_btn.clicked.connect(self.buy_lowest_ticker)
+        
+        self.sell_lowest_btn = QPushButton("💸 Продать самый дешёвый")
+        self.sell_lowest_btn.setStyleSheet(
+            "QPushButton { background-color: #e67e22; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:hover { background-color: #d35400; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.sell_lowest_btn.clicked.connect(self.sell_lowest_ticker)
+        
+        manual_trading_layout.addWidget(self.buy_lowest_btn)
+        manual_trading_layout.addWidget(self.sell_lowest_btn)
+        manual_trading_layout.addStretch()
+        
+        # Третья строка - кнопка коннекта с нейросетью
+        neural_network_layout = QHBoxLayout()
+        
+        self.connect_neural_btn = QPushButton("🧠 Подключить нейросеть")
+        self.connect_neural_btn.setStyleSheet(
+            "QPushButton { background-color: #9b59b6; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:hover { background-color: #8e44ad; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.connect_neural_btn.clicked.connect(self.connect_neural_network)
+        
+        self.neural_status_label = QLabel("❌ Нейросеть не подключена")
+        self.neural_status_label.setStyleSheet("color: #e74c3c; font-weight: bold; padding: 8px;")
+        
+        neural_network_layout.addWidget(self.connect_neural_btn)
+        neural_network_layout.addWidget(self.neural_status_label)
+        neural_network_layout.addStretch()
+        
+        # Добавляем кнопки управления
         control_layout.addLayout(main_buttons_layout)
+        control_layout.addLayout(manual_trading_layout)
+        control_layout.addLayout(neural_network_layout)
         
         layout.addWidget(control_frame)
         
@@ -2998,6 +3050,34 @@ class TradingBotMainWindow(QMainWindow):
         
         # Обновляем таймер
         self.update_balance_limit_timer_display()
+
+    def update_balance_info(self):
+        """Обновление информации о балансе для пересчета ограничений"""
+        try:
+            # Если есть текущий баланс, обновляем отображение ограничителя
+            if hasattr(self, 'current_balance') and self.current_balance:
+                # Пересчитываем общий баланс в USD
+                total_usd = 0.0
+                if 'coins' in self.current_balance:
+                    coins = self.current_balance['coins']
+                    if isinstance(coins, list):
+                        for coin in coins:
+                            usd_value = float(coin.get('usdValue', 0))
+                            total_usd += usd_value
+                
+                self.total_balance_usd = total_usd
+                
+                # Обновляем отображение ограничителя баланса
+                self.update_balance_limit_display()
+                
+                self.add_log_message(f"✅ Информация о балансе обновлена (общий баланс: ${total_usd:.2f})")
+            else:
+                self.add_log_message("⚠️ Нет данных о балансе для обновления")
+                
+        except Exception as e:
+            error_msg = f"Ошибка при обновлении информации о балансе: {e}"
+            self.logger.error(error_msg)
+            self.add_log_message(f"❌ {error_msg}")
     
     def format_time_remaining(self, seconds):
         """Форматирование оставшегося времени в читаемый вид"""
@@ -3773,38 +3853,38 @@ class TradingBotMainWindow(QMainWindow):
             symbol_item = QTableWidgetItem(ticker.get('symbol', ''))
             self.ticker_table.setItem(i, 0, symbol_item)
             
-            # Последняя цена
-            last_price = float(ticker.get('lastPrice', 0))
+            # Последняя цена - проверяем разные варианты названий полей
+            last_price = float(ticker.get('lastPrice', ticker.get('price', ticker.get('last', 0))))
             price_item = QTableWidgetItem(f"{last_price:.8f}")
             price_item.setData(Qt.DisplayRole, last_price)
             self.ticker_table.setItem(i, 1, price_item)
             
-            # Максимальная цена за 24ч
-            high_price = float(ticker.get('highPrice24h', 0))
+            # Максимальная цена за 24ч - проверяем разные варианты
+            high_price = float(ticker.get('highPrice24h', ticker.get('high24h', ticker.get('high', 0))))
             high_item = QTableWidgetItem(f"{high_price:.8f}")
             high_item.setData(Qt.DisplayRole, high_price)
             self.ticker_table.setItem(i, 2, high_item)
             
-            # Минимальная цена за 24ч
-            low_price = float(ticker.get('lowPrice24h', 0))
+            # Минимальная цена за 24ч - проверяем разные варианты
+            low_price = float(ticker.get('lowPrice24h', ticker.get('low24h', ticker.get('low', 0))))
             low_item = QTableWidgetItem(f"{low_price:.8f}")
             low_item.setData(Qt.DisplayRole, low_price)
             self.ticker_table.setItem(i, 3, low_item)
             
-            # Объем за 24ч
-            volume = float(ticker.get('volume24h', 0))
+            # Объем за 24ч - проверяем разные варианты
+            volume = float(ticker.get('volume24h', ticker.get('volume', ticker.get('vol', 0))))
             volume_item = QTableWidgetItem(f"{volume:.2f}")
             volume_item.setData(Qt.DisplayRole, volume)
             self.ticker_table.setItem(i, 4, volume_item)
             
-            # Оборот за 24ч
-            turnover = float(ticker.get('turnover24h', 0))
+            # Оборот за 24ч - проверяем разные варианты
+            turnover = float(ticker.get('turnover24h', ticker.get('turnover', ticker.get('quoteVolume', 0))))
             turnover_item = QTableWidgetItem(f"{turnover:.2f}")
             turnover_item.setData(Qt.DisplayRole, turnover)
             self.ticker_table.setItem(i, 5, turnover_item)
             
-            # Изменение за 24ч
-            price_change = float(ticker.get('priceChangePercent24h', 0))
+            # Изменение за 24ч - проверяем разные варианты
+            price_change = float(ticker.get('priceChangePercent24h', ticker.get('priceChangePercent', ticker.get('change24h', 0))))
             change_item = QTableWidgetItem(f"{price_change:.2f}%")
             change_item.setData(Qt.DisplayRole, price_change)
             
@@ -3895,7 +3975,7 @@ class TradingBotMainWindow(QMainWindow):
             "1 неделя": "1w",
             "1 месяц": "1M"
         }
-        interval = interval_map.get(interval_text, "1h")
+        interval = interval_map.get(interval_text, "4h")
         
         try:
             # Получаем данные для графика с указанием категории 'spot'
@@ -3906,7 +3986,7 @@ class TradingBotMainWindow(QMainWindow):
                     self.logger.warning(f"Символ {symbol}: ошибка периода, пробуем альтернативный интервал")
                     # Преобразуем интервал в поддерживаемый формат
                     interval_map_fallback = {
-                        "1h": "60",
+                        "4h": "240",
                         "4h": "240",
                         "1d": "D",
                         "1w": "W",
@@ -3986,6 +4066,147 @@ class TradingBotMainWindow(QMainWindow):
             self.add_log_message(f"❌ {error_msg}")
             self.chart_placeholder.setText(f"Ошибка построения графика для {symbol}")
     
+    def buy_lowest_ticker(self):
+        """Покупка самого дешевого тикера"""
+        try:
+            # Проверяем наличие данных по тикерам
+            if not hasattr(self, 'tickers_data') or not self.tickers_data:
+                self.add_log_message("❌ Нет данных по тикерам для покупки")
+                return
+            
+            # Находим самый дешевый тикер
+            lowest_symbol = min(
+                self.tickers_data.items(), 
+                key=lambda x: float(x[1].get('lastPrice', float('inf')))
+            )[0]
+            
+            self.add_log_message(f"🔍 Выбран самый дешевый тикер: {lowest_symbol}")
+            
+            # Проверяем наличие торгового воркера
+            if not hasattr(self, 'trading_worker') or self.trading_worker is None:
+                self.add_log_message("❌ Торговый воркер не инициализирован")
+                return
+            
+            # Создаем анализ для ручной покупки
+            analysis = {'signal': 'BUY', 'confidence': 1.0}
+            
+            # Временно включаем торговлю для выполнения ручной сделки
+            original_trading_state = getattr(self.trading_worker, 'trading_enabled', False)
+            self.trading_worker.trading_enabled = True
+            
+            # Выполняем сделку
+            self.trading_worker._execute_trade(lowest_symbol, analysis, session_id="manual_buy")
+            
+            # Восстанавливаем исходное состояние торговли
+            self.trading_worker.trading_enabled = original_trading_state
+            
+            self.add_log_message(f"💰 Отправлен ордер на покупку {lowest_symbol}")
+            
+        except Exception as e:
+            self.add_log_message(f"❌ Ошибка при покупке: {str(e)}")
+            self.logger.error(f"Ошибка в buy_lowest_ticker: {e}")
+
+    def sell_lowest_ticker(self):
+        """Продажа самого дешевого актива в портфеле"""
+        try:
+            # Проверяем наличие данных о балансе
+            if not hasattr(self, 'current_balance') or not self.current_balance:
+                self.add_log_message("❌ Нет данных о портфеле для продажи")
+                return
+            
+            # Получаем список монет
+            coins = self.current_balance.get('coins', [])
+            if not isinstance(coins, list):
+                self.add_log_message("❌ Неверный формат данных о балансе")
+                return
+            
+            # Фильтруем монеты с положительным балансом (исключаем стейблкоины)
+            non_stable_coins = []
+            for coin in coins:
+                usd_value = float(coin.get('usdValue', 0))
+                coin_name = coin.get('coin', '')
+                # Исключаем стейблкоины и монеты с нулевым балансом
+                if usd_value > 1.0 and coin_name not in ['USDT', 'USDC', 'BUSD', 'DAI']:
+                    non_stable_coins.append(coin)
+            
+            if not non_stable_coins:
+                self.add_log_message("❌ Нет активов для продажи (минимум $1)")
+                return
+            
+            # Находим актив с минимальной USD стоимостью
+            lowest_coin = min(non_stable_coins, key=lambda c: float(c.get('usdValue', 0)))
+            symbol = lowest_coin['coin'] + "USDT"
+            
+            self.add_log_message(f"🔍 Выбран актив для продажи: {symbol} (${lowest_coin.get('usdValue', 0)})")
+            
+            # Проверяем наличие торгового воркера
+            if not hasattr(self, 'trading_worker') or self.trading_worker is None:
+                self.add_log_message("❌ Торговый воркер не инициализирован")
+                return
+            
+            # Создаем анализ для ручной продажи
+            analysis = {'signal': 'SELL', 'confidence': 1.0}
+            
+            # Временно включаем торговлю для выполнения ручной сделки
+            original_trading_state = getattr(self.trading_worker, 'trading_enabled', False)
+            self.trading_worker.trading_enabled = True
+            
+            # Выполняем сделку
+            self.trading_worker._execute_trade(symbol, analysis, session_id="manual_sell")
+            
+            # Восстанавливаем исходное состояние торговли
+            self.trading_worker.trading_enabled = original_trading_state
+            
+            self.add_log_message(f"💸 Отправлен ордер на продажу {symbol}")
+            
+        except Exception as e:
+            self.add_log_message(f"❌ Ошибка при продаже: {str(e)}")
+            self.logger.error(f"Ошибка в sell_lowest_ticker: {e}")
+
+    def connect_neural_network(self):
+        """Подключение к программе нейросети"""
+        try:
+            import subprocess
+            import os
+            
+            # Путь к программе trainer_gui.py
+            trainer_path = os.path.join(os.path.dirname(__file__), 'trainer_gui.py')
+            
+            if not os.path.exists(trainer_path):
+                self.add_log_message("❌ Файл trainer_gui.py не найден")
+                return
+            
+            # Запускаем trainer_gui.py в отдельном процессе
+            try:
+                subprocess.Popen([
+                    'python', trainer_path
+                ], cwd=os.path.dirname(__file__))
+                
+                self.add_log_message("🧠 Запуск программы нейросети...")
+                
+                # Обновляем статус подключения
+                self.neural_status_label.setText("✅ Нейросеть запущена")
+                self.neural_status_label.setStyleSheet("color: #27ae60; font-weight: bold; padding: 8px;")
+                
+                # Отключаем кнопку на некоторое время
+                self.connect_neural_btn.setEnabled(False)
+                self.connect_neural_btn.setText("🧠 Нейросеть запущена")
+                
+                # Через 3 секунды возвращаем кнопку в исходное состояние
+                QTimer.singleShot(3000, self.reset_neural_button)
+                
+            except Exception as e:
+                self.add_log_message(f"❌ Ошибка запуска нейросети: {str(e)}")
+                
+        except Exception as e:
+            self.add_log_message(f"❌ Ошибка подключения к нейросети: {str(e)}")
+            self.logger.error(f"Ошибка в connect_neural_network: {e}")
+    
+    def reset_neural_button(self):
+        """Сброс состояния кнопки нейросети"""
+        self.connect_neural_btn.setEnabled(True)
+        self.connect_neural_btn.setText("🧠 Подключить нейросеть")
+
     def closeEvent(self, event):
         """Обработка закрытия приложения"""
         reply = QMessageBox.question(

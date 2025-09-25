@@ -200,3 +200,120 @@ Exception: API ошибка: invalid request, please check your server timestamp
 2025-09-06 16:44:33,140 - __main__ - INFO - ============================================================
 2025-09-06 16:44:33,140 - __main__ - INFO - ✅ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО УСПЕШНО
 2025-09-06 16:44:33,140 - __main__ - INFO - ============================================================
+2025-09-24 16:20:19,132 - __main__ - INFO - ============================================================
+2025-09-24 16:20:19,132 - __main__ - INFO - 🚀 ЗАПУСК ТЕСТИРОВАНИЯ API ПОДКЛЮЧЕНИЯ
+2025-09-24 16:20:19,132 - __main__ - INFO - ============================================================
+2025-09-24 16:20:19,133 - __main__ - INFO - 📋 Загрузка конфигурации...
+2025-09-24 16:20:19,134 - __main__ - INFO - 🔑 API Key: 9HlqDp2h1H...
+2025-09-24 16:20:19,134 - __main__ - INFO - 🔐 API Secret: ************************************
+2025-09-24 16:20:19,135 - __main__ - INFO - 🌐 Testnet: True
+2025-09-24 16:20:19,135 - __main__ - INFO - 📡 Инициализация Bybit клиента...
+2025-09-24 16:20:19,475 - __main__ - INFO - ✅ Клиент успешно создан
+2025-09-24 16:20:19,475 - __main__ - INFO - 🔗 Тестирование подключения...
+2025-09-24 16:20:19,481 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api-testnet.bybit.com:443
+2025-09-24 16:20:20,118 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/time HTTP/1.1" 200 134
+2025-09-24 16:20:20,119 - api.bybit_client - DEBUG - Строка для подписи: 17587020200009HlqDp2h1HwSP8Ydnk20000
+2025-09-24 16:20:20,389 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/time HTTP/1.1" 200 134
+2025-09-24 16:20:20,390 - __main__ - INFO - 📊 Результат теста подключения: True
+2025-09-24 16:20:20,390 - __main__ - INFO - ⏰ Получение времени сервера...
+2025-09-24 16:20:20,658 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/time HTTP/1.1" 200 134
+2025-09-24 16:20:20,659 - api.bybit_client - DEBUG - Строка для подписи: 17587020210009HlqDp2h1HwSP8Ydnk20000
+2025-09-24 16:20:21,279 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/time HTTP/1.1" 200 134
+2025-09-24 16:20:21,280 - __main__ - INFO - 🕐 Время сервера: 1758702022
+2025-09-24 16:20:21,280 - __main__ - INFO - 💰 Получение баланса кошелька...
+2025-09-24 16:20:21,280 - api.bybit_client - INFO - Запрос баланса кошелька: UNIFIED, монета: все
+2025-09-24 16:20:21,549 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/time HTTP/1.1" 200 134
+2025-09-24 16:20:21,549 - api.bybit_client - DEBUG - Строка для подписи: 17587020220009HlqDp2h1HwSP8Ydnk20000accountType=UNIFIED
+2025-09-24 16:20:21,821 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/account/wallet-balance?accountType=UNIFIED HTTP/1.1" 200 None
+2025-09-24 16:20:21,822 - __main__ - INFO - 📈 РЕЗУЛЬТАТ ЗАПРОСА БАЛАНСА:
+2025-09-24 16:20:21,822 - __main__ - INFO - Raw response: {
+  "list": [
+    {
+      "accountIMRate": "0",
+      "totalMaintenanceMarginByMp": "0",
+      "totalInitialMargin": "0",
+      "accountType": "UNIFIED",
+      "accountMMRate": "0",
+      "accountMMRateByMp": "0",
+      "accountIMRateByMp": "0",
+      "totalInitialMarginByMp": "0",
+      "totalMaintenanceMargin": "0",
+      "totalEquity": "234968.6515616",
+      "totalMarginBalance": "10005.9207416",
+      "totalAvailableBalance": "10005.9207416",
+      "totalPerpUPL": "0",
+      "totalWalletBalance": "10005.9207416",
+      "accountLTV": "0",
+      "coin": [
+        {
+          "spotBorrow": "0",
+          "availableToBorrow": "",
+          "bonus": "0",
+          "accruedInterest": "0",
+          "availableToWithdraw": "",
+          "totalOrderIM": "0",
+          "equity": "2",
+          "totalPositionMM": "0",
+          "usdValue": "224962.73082",
+          "unrealisedPnl": "0",
+          "collateralSwitch": false,
+          "spotHedgingQty": "0",
+          "borrowAmount": "0.000000000000000000",
+          "totalPositionIM": "0",
+          "walletBalance": "2",
+          "cumRealisedPnl": "0",
+          "locked": "0",
+          "marginCollateral": true,
+          "coin": "BTC"
+        },
+        {
+          "spotBorrow": "0",
+          "availableToBorrow": "",
+          "bonus": "1.8",
+          "accruedInterest": "0",
+          "availableToWithdraw": "",
+          "totalOrderIM": "0",
+          "equity": "10001.8",
+          "totalPositionMM": "0",
+          "usdValue": "10005.9207416",
+          "unrealisedPnl": "0",
+          "collateralSwitch": true,
+          "spotHedgingQty": "0",
+          "borrowAmount": "0.000000000000000000",
+          "totalPositionIM": "0",
+          "walletBalance": "10001.8",
+          "cumRealisedPnl": "0",
+          "locked": "0",
+          "marginCollateral": true,
+          "coin": "USDT"
+        }
+      ]
+    }
+  ]
+}
+2025-09-24 16:20:21,823 - __main__ - INFO - 💵 ДЕТАЛИ БАЛАНСА:
+2025-09-24 16:20:21,823 - __main__ - INFO -    💰 Общий баланс: $0.000000
+2025-09-24 16:20:21,824 - __main__ - INFO -    💳 Доступный баланс: $0.000000
+2025-09-24 16:20:21,824 - __main__ - INFO -    📊 Нереализованный P&L: $0.000000
+2025-09-24 16:20:21,824 - __main__ - WARNING - ⚠️ Список активов пуст или не найден
+2025-09-24 16:20:21,824 - __main__ - INFO - 📍 Получение позиций...
+2025-09-24 16:20:21,824 - api.bybit_client - INFO - Запрос позиций: {'category': 'linear', 'settleCoin': 'USDT'}
+2025-09-24 16:20:22,093 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/time HTTP/1.1" 200 134
+2025-09-24 16:20:22,094 - api.bybit_client - DEBUG - Строка для подписи: 17587020220009HlqDp2h1HwSP8Ydnk20000category=linear&settleCoin=USDT
+2025-09-24 16:20:22,367 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/position/list?category=linear&settleCoin=USDT HTTP/1.1" 200 125
+2025-09-24 16:20:22,368 - api.bybit_client - INFO - Получено позиций: 0
+2025-09-24 16:20:22,368 - api.bybit_client - WARNING - Нет позиций для linear с параметрами {'category': 'linear', 'settleCoin': 'USDT'}
+2025-09-24 16:20:22,368 - __main__ - INFO - 📋 ПОЗИЦИИ: найдено 0 позиций
+2025-09-24 16:20:22,369 - __main__ - INFO - 🔧 Получение информации об инструментах...
+2025-09-24 16:20:22,635 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/time HTTP/1.1" 200 134
+2025-09-24 16:20:22,637 - api.bybit_client - DEBUG - Строка для подписи: 17587020230009HlqDp2h1HwSP8Ydnk20000category=linear
+2025-09-24 16:20:22,931 - urllib3.connectionpool - DEBUG - https://api-testnet.bybit.com:443 "GET /v5/market/instruments-info?category=linear HTTP/1.1" 200 None
+2025-09-24 16:20:23,196 - __main__ - INFO - 🛠️ Доступно инструментов: 500
+2025-09-24 16:20:23,196 - __main__ - INFO -    🔹 0GUSDT: Trading
+2025-09-24 16:20:23,197 - __main__ - INFO -    🔹 1000000BABYDOGEUSDT: Trading
+2025-09-24 16:20:23,197 - __main__ - INFO -    🔹 1000000CHEEMSUSDT: Trading
+2025-09-24 16:20:23,197 - __main__ - INFO -    🔹 1000000MOGUSDT: Trading
+2025-09-24 16:20:23,197 - __main__ - INFO -    🔹 1000000PEIPEIUSDT: Trading
+2025-09-24 16:20:23,198 - __main__ - INFO - ============================================================
+2025-09-24 16:20:23,198 - __main__ - INFO - ✅ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО УСПЕШНО
+2025-09-24 16:20:23,198 - __main__ - INFO - ============================================================

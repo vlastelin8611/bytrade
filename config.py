@@ -71,7 +71,7 @@ KLINE_LIMIT = 200
 ML_CONFIG = {
     'retrain_interval_hours': 24,  # Переобучение каждые 24 часа
     'min_samples_for_training': 100,  # Минимум образцов для обучения
-    'feature_window': 50,  # Окно для расчета признаков
+    'feature_window': 20,  # Окно для расчета признаков (уменьшено для работы с малым количеством свечей)
     'prediction_horizon': 1,  # Горизонт прогнозирования (свечей)
     'model_type': 'random_forest',  # Тип модели: 'random_forest', 'gradient_boosting'
     'cross_validation_folds': 5,  # Количество фолдов для кросс-валидации

@@ -249,6 +249,58 @@ class DatabaseManager:
                     )
                     
         except Exception as e:
+            self.logger.error(f"Ошибка логирования торговой операции: {e}")
+    
+    def log_analysis(self, analysis_data: Dict):
+        """Логирование результатов анализа ML стратегии"""
+        try:
+            with self._lock:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    # Создаем таблицу для анализа если не существует
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS ml_analysis (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            symbol TEXT,
+                            current_price REAL,
+                            features TEXT,
+                            regime TEXT,
+                            prediction TEXT,
+                            confidence REAL,
+                            signal TEXT
+                        )
+                    """)
+                    
+                    # Вставляем данные анализа
+                    cursor.execute("""
+                        INSERT INTO ml_analysis 
+                        (symbol, current_price, features, regime, prediction, confidence, signal)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        analysis_data.get('symbol'),
+                        analysis_data.get('current_price'),
+                        json.dumps(analysis_data.get('features', [])),
+                        json.dumps(analysis_data.get('regime', {})),
+                        json.dumps(analysis_data.get('prediction', {})),
+                        analysis_data.get('prediction', {}).get('confidence', 0.0),
+                        analysis_data.get('prediction', {}).get('signal')
+                    ))
+                    
+                    conn.commit()
+                    
+                    # Логирование системного действия
+                    self.log_system_action(
+                        'INFO', 'ML_STRATEGY', 'ANALYSIS_COMPLETED',
+                        {
+                            'symbol': analysis_data.get('symbol'),
+                            'signal': analysis_data.get('prediction', {}).get('signal'),
+                            'confidence': analysis_data.get('prediction', {}).get('confidence', 0.0)
+                        }
+                    )
+                    
+        except Exception as e:
             self.logger.error(f"Ошибка логирования торговли: {e}")
     
     def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:

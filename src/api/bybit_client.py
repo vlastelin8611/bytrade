@@ -465,17 +465,26 @@ class BybitClient:
         ожидаемом в trading_bot_main.py
         """
         try:
-            # Преобразуем интервалы из формата с буквой (1m, 5m, 15m) в числовой формат API (1, 5, 15)
+            # Расширенная карта интервалов с поддержкой множественных форматов
             interval_map = {
-                "1m": "1",
-                "5m": "5",
-                "15m": "15",
-                "30m": "30",
-                "1h": "60",
-                "4h": "240",
-                "1d": "D",
-                "1w": "W",
-                "1M": "M"
+                # Минутные интервалы
+                "1": "1", "1m": "1", "1min": "1",
+                "3": "3", "3m": "3", "3min": "3",
+                "5": "5", "5m": "5", "5min": "5",
+                "15": "15", "15m": "15", "15min": "15",
+                "30": "30", "30m": "30", "30min": "30",
+                
+                # Часовые интервалы
+                "60": "60", "1h": "60", "1hour": "60",
+                "120": "120", "2h": "120", "2hour": "120",
+                "240": "240", "4h": "240", "4hour": "240",
+                "360": "360", "6h": "360", "6hour": "360",
+                "720": "720", "12h": "720", "12hour": "720",
+                
+                # Дневные и недельные интервалы
+                "D": "D", "1d": "D", "1day": "D", "daily": "D",
+                "W": "W", "1w": "W", "1week": "W", "weekly": "W",
+                "M": "M", "1M": "M", "1month": "M", "monthly": "M"
             }
             
             api_interval = interval_map.get(interval, interval)
@@ -497,14 +506,23 @@ class BybitClient:
             if "Invalid period" in error_msg or "invalid interval" in error_msg.lower():
                 self.logger.warning(f"Интервал {interval} не поддерживается для {symbol}, пробуем альтернативные")
                 
-                # Список альтернативных интервалов в порядке приоритета
+                # Расширенный список альтернативных интервалов в порядке приоритета
                 alternative_intervals = []
-                if interval == "1h" or api_interval == "60":
-                    alternative_intervals = ["15", "30", "240"]  # 15m, 30m, 4h
-                elif interval == "4h" or api_interval == "240":
-                    alternative_intervals = ["60", "D"]  # 1h, 1d
-                elif interval == "1d" or api_interval == "D":
-                    alternative_intervals = ["240", "W"]  # 4h, 1w
+                
+                # Определяем альтернативы на основе исходного интервала
+                if interval in ["1h", "60", "1hour"]:
+                    alternative_intervals = ["30", "15", "240", "120"]  # 30m, 15m, 4h, 2h
+                elif interval in ["4h", "240", "4hour"]:
+                    alternative_intervals = ["120", "60", "360", "D"]  # 2h, 1h, 6h, 1d
+                elif interval in ["1d", "D", "daily"]:
+                    alternative_intervals = ["720", "240", "W"]  # 12h, 4h, 1w
+                elif interval in ["15", "15m", "15min"]:
+                    alternative_intervals = ["5", "30", "60"]  # 5m, 30m, 1h
+                elif interval in ["5", "5m", "5min"]:
+                    alternative_intervals = ["1", "15", "30"]  # 1m, 15m, 30m
+                else:
+                    # Универсальные альтернативы для неизвестных интервалов
+                    alternative_intervals = ["60", "15", "240", "D", "5", "30"]
                 
                 # Пробуем альтернативные интервалы
                 for alt_interval in alternative_intervals:
@@ -518,14 +536,34 @@ class BybitClient:
                             **({"start": start} if start is not None else {}),
                             **({"end": end} if end is not None else {})
                         })
-                        self.logger.info(f"Успешно получены данные с интервалом {alt_interval} для {symbol}")
+                        self.logger.info(f"✅ Успешно получены данные с интервалом {alt_interval} для {symbol}")
                         return klines
                     except Exception as alt_error:
                         self.logger.debug(f"Альтернативный интервал {alt_interval} также не работает: {alt_error}")
                         continue
                 
+                # Если все альтернативы не сработали, пробуем базовые интервалы
+                basic_intervals = ["60", "15", "D", "5"]  # Самые распространенные интервалы
+                for basic_interval in basic_intervals:
+                    if basic_interval not in alternative_intervals:  # Избегаем повторных попыток
+                        try:
+                            self.logger.info(f"Пробуем базовый интервал {basic_interval} для {symbol}")
+                            klines = self._make_request('GET', '/v5/market/kline', {
+                                'category': category,
+                                'symbol': symbol,
+                                'interval': basic_interval,
+                                'limit': limit,
+                                **({"start": start} if start is not None else {}),
+                                **({"end": end} if end is not None else {})
+                            })
+                            self.logger.info(f"✅ Успешно получены данные с базовым интервалом {basic_interval} для {symbol}")
+                            return klines
+                        except Exception as basic_error:
+                            self.logger.debug(f"Базовый интервал {basic_interval} также не работает: {basic_error}")
+                            continue
+                
                 # Если все альтернативы не сработали
-                self.logger.error(f"Не удалось получить данные для {symbol} ни с одним интервалом")
+                self.logger.error(f"❌ Не удалось получить данные для {symbol} ни с одним интервалом")
             
             self.logger.error(f"API ошибка: {error_msg}")
             raise Exception(f"API ошибка: {error_msg}")

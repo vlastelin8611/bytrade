@@ -190,7 +190,7 @@ class AdaptiveMLStrategy:
         
         # Параметры стратегии
         self.feature_window = config.get('feature_window', 50)
-        self.confidence_threshold = config.get('confidence_threshold', 0.65)
+        self.confidence_threshold = config.get('confidence_threshold', 0.5)  # Временно снижен с 0.65 до 0.5 для тестирования
         self.use_technical_indicators = config.get('use_technical_indicators', True)
         self.use_market_regime = config.get('use_market_regime', True)
         
@@ -198,6 +198,7 @@ class AdaptiveMLStrategy:
         self.models = {}
         self.scalers = {}
         self.model_performance = {}
+        self.performance = {}  # Добавляем атрибут для хранения метрик обучения
         
         # Компоненты анализа
         self.technical_indicators = TechnicalIndicators()
@@ -399,8 +400,19 @@ class AdaptiveMLStrategy:
             
             # Ценовые признаки
             current_price = closes[-1]
-            price_change_1h = (closes[-1] - closes[-2]) / closes[-2] if len(closes) > 1 else 0
-            price_change_24h = (closes[-1] - closes[-25]) / closes[-25] if len(closes) > 24 else 0
+            
+            # Безопасный расчет изменений цены
+            if len(closes) > 1 and closes[-2] != 0 and np.isfinite(closes[-1]) and np.isfinite(closes[-2]):
+                price_change_1h = (closes[-1] - closes[-2]) / closes[-2]
+                price_change_1h = np.clip(price_change_1h, -0.5, 0.5)  # Ограничиваем экстремальные изменения
+            else:
+                price_change_1h = 0
+                
+            if len(closes) > 24 and closes[-25] != 0 and np.isfinite(closes[-1]) and np.isfinite(closes[-25]):
+                price_change_24h = (closes[-1] - closes[-25]) / closes[-25]
+                price_change_24h = np.clip(price_change_24h, -0.5, 0.5)  # Ограничиваем экстремальные изменения
+            else:
+                price_change_24h = 0
             
             features.extend([current_price, price_change_1h, price_change_24h])
             
@@ -422,9 +434,17 @@ class AdaptiveMLStrategy:
                 
                 # Bollinger Bands
                 bb_data = self.technical_indicators.bollinger_bands(closes)
-                if bb_data['middle']:
-                    bb_position = (current_price - bb_data['lower'][-1]) / (bb_data['upper'][-1] - bb_data['lower'][-1])
-                    features.append(bb_position)
+                if bb_data['middle'] and bb_data['upper'] and bb_data['lower']:
+                    upper_val = bb_data['upper'][-1]
+                    lower_val = bb_data['lower'][-1]
+                    # Проверяем на деление на ноль и бесконечные значения
+                    if upper_val != lower_val and np.isfinite(upper_val) and np.isfinite(lower_val) and np.isfinite(current_price):
+                        bb_position = (current_price - lower_val) / (upper_val - lower_val)
+                        # Ограничиваем значение в разумных пределах
+                        bb_position = np.clip(bb_position, -2.0, 3.0)
+                        features.append(bb_position)
+                    else:
+                        features.append(0.5)
                 else:
                     features.append(0.5)
                 
@@ -432,26 +452,45 @@ class AdaptiveMLStrategy:
                 sma_10 = self.technical_indicators.sma(closes, 10)
                 sma_20 = self.technical_indicators.sma(closes, 20)
                 
-                if sma_10 and sma_20:
+                if sma_10 and sma_20 and sma_20[-1] != 0 and np.isfinite(sma_10[-1]) and np.isfinite(sma_20[-1]):
                     sma_ratio = sma_10[-1] / sma_20[-1]
+                    # Ограничиваем значение в разумных пределах
+                    sma_ratio = np.clip(sma_ratio, 0.5, 2.0)
                     features.append(sma_ratio)
                 else:
                     features.append(1.0)
             
             # Объемные признаки
             if len(volumes) > 1:
-                volume_change = (volumes[-1] - volumes[-2]) / volumes[-2] if volumes[-2] > 0 else 0
+                volume_change = (volumes[-1] - volumes[-2]) / volumes[-2] if volumes[-2] > 0 and np.isfinite(volumes[-1]) and np.isfinite(volumes[-2]) else 0
                 avg_volume = sum(volumes[-10:]) / min(10, len(volumes))
-                volume_ratio = volumes[-1] / avg_volume if avg_volume > 0 else 1
+                volume_ratio = volumes[-1] / avg_volume if avg_volume > 0 and np.isfinite(volumes[-1]) and np.isfinite(avg_volume) else 1
+                # Ограничиваем значения в разумных пределах
+                volume_change = np.clip(volume_change, -10.0, 10.0)
+                volume_ratio = np.clip(volume_ratio, 0.1, 10.0)
                 features.extend([volume_change, volume_ratio])
             else:
                 features.extend([0, 1])
             
             # Волатильность
             if len(closes) > 20:
-                returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
-                volatility = np.std(returns[-20:]) * 100
-                features.append(volatility)
+                returns = []
+                for i in range(1, len(closes)):
+                    if closes[i-1] != 0 and np.isfinite(closes[i]) and np.isfinite(closes[i-1]):
+                        ret = (closes[i] - closes[i-1]) / closes[i-1]
+                        # Ограничиваем экстремальные значения доходности
+                        ret = np.clip(ret, -0.5, 0.5)
+                        returns.append(ret)
+                    else:
+                        returns.append(0)
+                
+                if returns:
+                    volatility = np.std(returns[-20:]) * 100
+                    # Ограничиваем волатильность в разумных пределах
+                    volatility = np.clip(volatility, 0, 50)
+                    features.append(volatility)
+                else:
+                    features.append(0)
             else:
                 features.append(0)
             
@@ -669,6 +708,50 @@ class AdaptiveMLStrategy:
             
         except Exception as e:
             self.logger.error(f"Ошибка обучения модели для {symbol}: {e}")
+    
+    def train_model(self, symbol: str, features: List[List[float]], labels: List[int]):
+        """Обучение модели для конкретного символа"""
+        try:
+            if not SKLEARN_AVAILABLE or len(features) < 20:
+                self.logger.warning(f"Недостаточно данных для обучения {symbol}: {len(features)}")
+                return False
+            
+            X = np.array(features)
+            y = np.array(labels)
+            
+            # Разделение на обучающую и тестовую выборки
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # Нормализация признаков
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            # Обучение модели
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+            model.fit(X_train_scaled, y_train)
+            
+            # Оценка качества
+            y_pred = model.predict(X_test_scaled)
+            accuracy = accuracy_score(y_test, y_pred)
+            
+            # Сохранение модели и скейлера
+            self.models[symbol] = model
+            self.scalers[symbol] = scaler
+            self.model_performance[symbol] = accuracy
+            
+            # Обновляем атрибут performance для GUI
+            self.performance[symbol] = {
+                'accuracy': accuracy,
+                'samples': len(features)
+            }
+            
+            self.logger.info(f"Модель для {symbol} обучена с точностью: {accuracy:.3f}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка обучения модели для {symbol}: {e}")
+            return False
     
     def load_models(self):
         """Загрузка сохраненных моделей"""
